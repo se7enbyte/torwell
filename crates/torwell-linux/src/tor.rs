@@ -180,6 +180,16 @@ pub fn sole_loopback_listener(value: &str, port: u16) -> bool {
 mod tests {
     use super::*;
 
+    /// Regression: the unit once had `Requires=torwell-restore.service`, so every start failed
+    /// with "Unit torwell-restore.service not found" unless boot protection was enabled.
+    #[test]
+    fn tor_unit_does_not_require_the_optional_restore_unit() {
+        let u = render_unit(Path::new("/usr/bin/tor"), Path::new("/etc/torwell/torrc"));
+        assert!(!u.contains("Requires="), "{u}");
+        assert!(!u.contains("BindsTo=") && !u.contains("Requisite="), "{u}");
+        assert!(u.contains("User=torwell-tor") && !u.contains('@'), "{u}");
+    }
+
     #[test]
     fn torrc_binds_loopback_only_with_cookie_control_socket() {
         let c = Config::default();

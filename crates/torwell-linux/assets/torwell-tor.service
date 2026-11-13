@@ -3,8 +3,8 @@
 [Unit]
 Description=Torwell dedicated Tor instance
 Documentation=man:tor(1)
-After=torwell-restore.service
-Requires=torwell-restore.service
+# Ordering only: boot protection is optional, so Tor must not require the restore unit.
+After=network.target torwell-restore.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -30,7 +30,8 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK: tor reads interface addresses through netlink.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
