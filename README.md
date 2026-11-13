@@ -11,7 +11,7 @@ Route all of your computer's traffic through Tor, safely. A modern, Rust success
 
 - Sends all TCP and DNS traffic through Tor.
 - **Fails closed:** anything that cannot go through Tor (IPv6, other UDP, connections
-  opened before start) is blocked. If something breaks, traffic stays blocked instead of
+  opened before start, traffic from VMs and containers) is blocked. If something breaks, traffic stays blocked instead of
   leaking.
 - **Cleanly reversible:** touches only its own firewall table. Stop puts your network back
   exactly as it was. Your existing firewall rules are never flushed.
@@ -47,6 +47,8 @@ torwell-ui
 Check it works: `curl -s https://check.torproject.org/api/ip` should show `"IsTor":true`.
 
 ## Good to know
+
+Exactly what is and is not protected: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 - **Tor alone does not make you anonymous.** Logins, browser fingerprints and your
   behaviour can still identify you.

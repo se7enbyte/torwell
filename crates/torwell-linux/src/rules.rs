@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 pub const TABLE: &str = "torwell";
 pub const NAT_CHAIN: &str = "nat_output";
 pub const FILTER_CHAIN: &str = "filter_output";
+pub const FORWARD_CHAIN: &str = "filter_forward";
 
 pub struct RuleParams<'a> {
     pub token: &'a str,
@@ -74,7 +75,8 @@ fn rules(p: &RuleParams) -> Vec<(&'static str, &'static str, String)> {
         (
             FILTER_CHAIN,
             "f-dhcp4",
-            "meta nfproto ipv4 udp sport 68 udp dport 67 accept".to_string(),
+            // Root only: the DHCP client runs as root; nobody else gets a direct UDP path.
+            "meta skuid 0 meta nfproto ipv4 udp sport 68 udp dport 67 accept".to_string(),
         ),
         (
             FILTER_CHAIN,
@@ -84,6 +86,14 @@ fn rules(p: &RuleParams) -> Vec<(&'static str, &'static str, String)> {
         (
             FILTER_CHAIN,
             "f-rej-rest",
+            "reject with icmpx type admin-prohibited".to_string(),
+        ),
+        // VMs and containers (libvirt, docker, podman bridges) are routed through the
+        // forward hook, which the output chains never see. Without this they leave with the
+        // real IP while Torwell shows "connected".
+        (
+            FORWARD_CHAIN,
+            "fwd-rej",
             "reject with icmpx type admin-prohibited".to_string(),
         ),
     ]
@@ -175,6 +185,7 @@ fn expected_exprs(p: &RuleParams) -> Vec<(&'static str, &'static str, Value)> {
             FILTER_CHAIN,
             "f-dhcp4",
             json!([
+                eq(meta("skuid"), json!(0)),
                 eq(meta("nfproto"), json!("ipv4")),
                 eq(udp("sport"), json!(68)),
                 eq(udp("dport"), json!(67)),
@@ -191,6 +202,11 @@ fn expected_exprs(p: &RuleParams) -> Vec<(&'static str, &'static str, Value)> {
             "f-rej-rest",
             json!([{"reject": {"type": "icmpx", "expr": "admin-prohibited"}}]),
         ),
+        (
+            FORWARD_CHAIN,
+            "fwd-rej",
+            json!([{"reject": {"type": "icmpx", "expr": "admin-prohibited"}}]),
+        ),
     ]
 }
 
@@ -200,6 +216,7 @@ pub fn ruleset(p: &RuleParams) -> String {
     s.push_str(&format!("add table inet {TABLE}\n"));
     s.push_str(&format!("add chain inet {TABLE} {NAT_CHAIN} {{ type nat hook output priority -100 ; policy accept ; }}\n"));
     s.push_str(&format!("add chain inet {TABLE} {FILTER_CHAIN} {{ type filter hook output priority 0 ; policy drop ; }}\n"));
+    s.push_str(&format!("add chain inet {TABLE} {FORWARD_CHAIN} {{ type filter hook forward priority 0 ; policy drop ; }}\n"));
     for (chain, tag, body) in rules(p) {
         s.push_str(&format!(
             "add rule inet {TABLE} {chain} {body} comment \"torwell:{}:{tag}\"\n",
@@ -316,22 +333,23 @@ pub fn verify_listing(
             return Err("unexpected object kind (set/map/flowtable) in owned table".into());
         }
     }
-    if tables != 1 || chains.len() != 2 {
+    if tables != 1 || chains.len() != 3 {
         return Err(format!(
-            "expected 1 table and 2 chains, found {tables} and {}",
+            "expected 1 table and 3 chains, found {tables} and {}",
             chains.len()
         ));
     }
-    for (name, ty, prio, policy) in [
-        (NAT_CHAIN, "nat", -100, "accept"),
-        (FILTER_CHAIN, "filter", 0, "drop"),
+    for (name, ty, hook, prio, policy) in [
+        (NAT_CHAIN, "nat", "output", -100, "accept"),
+        (FILTER_CHAIN, "filter", "output", 0, "drop"),
+        (FORWARD_CHAIN, "filter", "forward", 0, "drop"),
     ] {
         let c = chains
             .iter()
             .find(|(n, _)| n == name)
             .ok_or(format!("chain {name} missing"))?;
         let c = &c.1;
-        if c["type"] != ty || c["hook"] != "output" || c["prio"] != prio || c["policy"] != policy {
+        if c["type"] != ty || c["hook"] != hook || c["prio"] != prio || c["policy"] != policy {
             return Err(format!("chain {name} has wrong type/hook/priority/policy"));
         }
         let got: Vec<&String> = rule_comments
@@ -348,7 +366,7 @@ pub fn verify_listing(
     }
     // Semantic check, independent of the fingerprint: every rule's expressions must be
     // exactly the expected ones. Comments alone prove nothing about what a rule does.
-    for (name, _, _, _) in [(NAT_CHAIN, "", 0, ""), (FILTER_CHAIN, "", 0, "")] {
+    for name in [NAT_CHAIN, FILTER_CHAIN, FORWARD_CHAIN] {
         let got = rule_exprs
             .iter()
             .filter(|(ch, _)| ch == name)
@@ -434,7 +452,9 @@ mod tests {
         assert!(accepts[1].contains("oifname \"lo\" accept"));
         assert!(accepts[2].contains("ip daddr 127.0.0.1 tcp dport 9040 ct status dnat accept"));
         assert!(accepts[3].contains("ip daddr 127.0.0.1 udp dport 5353 ct status dnat accept"));
-        assert!(accepts[4].contains("udp sport 68 udp dport 67 accept"));
+        assert!(
+            accepts[4].contains("meta skuid 0 meta nfproto ipv4 udp sport 68 udp dport 67 accept")
+        );
         let last = s.lines().last().unwrap();
         assert!(last.contains("reject with icmpx"));
         // TCP reject precedes the generic reject; no accept follows any reject.
@@ -451,7 +471,7 @@ mod tests {
                 .filter(|l| l.starts_with("add rule"))
                 .filter(|l| l.contains("comment \"torwell:abc123:"))
                 .count(),
-            11
+            12
         );
     }
 
@@ -461,8 +481,9 @@ mod tests {
             serde_json::json!({"table": {"family":"inet","name":"torwell","handle":1}}),
             serde_json::json!({"chain": {"family":"inet","table":"torwell","name":"nat_output","handle":1,"type":"nat","hook":"output","prio":-100,"policy":"accept"}}),
             serde_json::json!({"chain": {"family":"inet","table":"torwell","name":"filter_output","handle":2,"type":"filter","hook":"output","prio":0,"policy":"drop"}}),
+            serde_json::json!({"chain": {"family":"inet","table":"torwell","name":"filter_forward","handle":3,"type":"filter","hook":"forward","prio":0,"policy":"drop"}}),
         ];
-        for ch in [NAT_CHAIN, FILTER_CHAIN] {
+        for ch in [NAT_CHAIN, FILTER_CHAIN, FORWARD_CHAIN] {
             for (i, c) in expected_comments(p, ch).into_iter().enumerate() {
                 let expr = expected_exprs(p)
                     .into_iter()
@@ -485,7 +506,7 @@ mod tests {
         assert!(!fp.contains("handle"));
         // Same content with different handles still matches the fingerprint.
         verify_listing(
-            &listing(&p, |v| v["nftables"][4]["rule"]["handle"] = 999.into()),
+            &listing(&p, |v| v["nftables"][5]["rule"]["handle"] = 999.into()),
             &p,
             Some(&fp),
         )
@@ -494,6 +515,22 @@ mod tests {
         assert!(verify_listing(
             &listing(&p, |v| v["nftables"][3]["chain"]["policy"] =
                 "accept".into()),
+            &p,
+            None
+        )
+        .is_err());
+        // Forward chain opened, or removed entirely (VM/container traffic would bypass Tor).
+        assert!(verify_listing(
+            &listing(&p, |v| v["nftables"][4]["chain"]["policy"] =
+                "accept".into()),
+            &p,
+            None
+        )
+        .is_err());
+        assert!(verify_listing(
+            &listing(&p, |v| {
+                v["nftables"].as_array_mut().unwrap().remove(4);
+            }),
             &p,
             None
         )
@@ -509,7 +546,7 @@ mod tests {
         .is_err());
         // Expression altered but comment kept: fingerprint catches it.
         assert!(verify_listing(
-            &listing(&p, |v| v["nftables"][5]["rule"]["expr"] =
+            &listing(&p, |v| v["nftables"][6]["rule"]["expr"] =
                 serde_json::json!([{"accept": null}])),
             &p,
             Some(&fp)

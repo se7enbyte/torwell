@@ -72,6 +72,8 @@ fn ruleset_redirects_tcp_and_dns_and_blocks_everything_else_with_real_packets() 
         "\"arbitrary_udp_v4_blocked\": true",
         "\"ipv6_tcp_udp_dns_blocked\": true",
         "\"preexisting_flow_blocked_after_enforcement\": true",
+        "\"vm_traffic_was_forwarded_before_enforcement\": true",
+        "\"vm_traffic_blocked_after_enforcement\": true",
     ] {
         assert!(out.contains(check), "missing {check}:\n{out}");
     }
@@ -93,4 +95,25 @@ fn harness_detects_a_ruleset_that_rejects_redirected_flows() {
         .collect();
     let (ok, out) = run(&broken);
     assert!(!ok, "harness passed a broken ruleset:\n{out}");
+}
+
+/// Negative control for the forward chain: the output-only ruleset (before the VM/container
+/// fix) must fail the harness, proving the VM check can see a real bypass.
+#[test]
+fn harness_detects_vm_traffic_bypassing_an_output_only_ruleset() {
+    if !tools_ok() {
+        eprintln!("SKIPPED: unshare -Urn, python3 or nft unavailable");
+        return;
+    }
+    let output_only: String = ruleset(&params())
+        .lines()
+        .filter(|l| !l.contains("filter_forward"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let (ok, out) = run(&output_only);
+    assert!(!ok, "harness passed an output-only ruleset:\n{out}");
+    assert!(
+        out.contains("\"vm_traffic_blocked_after_enforcement\": false"),
+        "{out}"
+    );
 }

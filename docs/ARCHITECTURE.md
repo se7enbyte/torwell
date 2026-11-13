@@ -96,6 +96,7 @@ Arch packaging lives in `packaging/arch/` (`PKGBUILD`; build with `makepkg -s`).
 * [FEASIBILITY.md](FEASIBILITY.md) — feasibility decision
 * [IMPLEMENTATION.md](IMPLEMENTATION.md) — scope and invariants
 * [CORE.md](CORE.md) — `torwell-core` API
+* [THREAT_MODEL.md](THREAT_MODEL.md) — what is and is not protected
 * [LINUX.md](LINUX.md) — nftables policy, state, recovery, MAC, boot restore
 * [WINDOWS.md](WINDOWS.md) — WFP/Wintun design and release gates
 * [UI.md](UI.md), [PROTOCOL.md](PROTOCOL.md) — UI/engine boundary

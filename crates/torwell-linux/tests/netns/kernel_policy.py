@@ -39,6 +39,10 @@ table inet observe {
   counter leaked_v4 {}
   counter leaked_v6 {}
   counter leaked_udp_flow {}
+  counter leaked_forward {}
+  chain vmfwd { type filter hook forward priority 100; policy accept;
+    oifname "dummy0" counter name leaked_forward
+  }
   chain out { type filter hook output priority 100; policy accept;
     oifname "dummy0" udp dport 7777 counter name leaked_udp_flow
     oifname "dummy0" meta nfproto ipv4 counter name leaked_v4
@@ -57,11 +61,66 @@ def counter(name):
     raise RuntimeError("counter missing")
 
 
+# A "VM": a TUN device standing in for a libvirt/docker guest. Packets written into it
+# arrive from 10.8.8.2 and are routed (forwarded) out through dummy0, never passing the
+# output hook. (veth would need a kernel module an unprivileged namespace cannot load.)
+import fcntl
+import struct
+
+TUNSETIFF, IFF_TUN, IFF_NO_PI = 0x400454CA, 0x0001, 0x1000
+tun = os.open("/dev/net/tun", os.O_RDWR)
+fcntl.ioctl(tun, TUNSETIFF, struct.pack("16sH", b"vm0", IFF_TUN | IFF_NO_PI))
+sh("ip", "addr", "add", "10.8.8.1/24", "dev", "vm0")
+sh("ip", "link", "set", "vm0", "up")
+with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
+    f.write("1")
+
+
+def csum(data):
+    if len(data) % 2:
+        data += b"\0"
+    t = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    t = (t >> 16) + (t & 0xFFFF)
+    t += t >> 16
+    return ~t & 0xFFFF
+
+
+def ipv4(proto, payload, src="10.8.8.2", dst="10.9.9.9"):
+    s4, d4 = socket.inet_aton(src), socket.inet_aton(dst)
+    hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 1, 0, 64, proto, 0, s4, d4)
+    hdr = hdr[:10] + struct.pack("!H", csum(hdr)) + hdr[12:]
+    return hdr, s4, d4, payload
+
+
+def udp_packet(dport):
+    body = b"vm"
+    u = struct.pack("!HHHH", 40000, dport, 8 + len(body), 0) + body
+    hdr, s4, d4, _ = ipv4(17, u)
+    c = csum(s4 + d4 + struct.pack("!BBH", 0, 17, len(u)) + u)
+    return hdr + u[:6] + struct.pack("!H", c) + u[8:]
+
+
+def tcp_syn(dport):
+    t = struct.pack("!HHIIBBHHH", 40001, dport, 1, 0, 5 << 4, 0x02, 64240, 0, 0)
+    hdr, s4, d4, _ = ipv4(6, t)
+    c = csum(s4 + d4 + struct.pack("!BBH", 0, 6, len(t)) + t)
+    return hdr + t[:16] + struct.pack("!H", c) + t[18:]
+
+
+def vm_traffic():
+    for pkt in (udp_packet(9999), udp_packet(53), udp_packet(443), tcp_syn(443), tcp_syn(80)):
+        os.write(tun, pkt)
+    import time
+    time.sleep(0.2)
+
+
 # A pre-existing "connected" UDP flow (conntrack-tracked) opened before enforcement.
 flow = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 flow.connect(("10.9.9.9", 7777))
 flow.send(b"before")
 before_flow = counter("leaked_udp_flow")
+vm_traffic()
+fwd_before = counter("leaked_forward")
 
 sh("nft", "-f", ruleset_path)
 
@@ -139,6 +198,10 @@ try:
     flow.send(b"after")
 except OSError:
     pass
+vm_traffic()
+results["vm_traffic_was_forwarded_before_enforcement"] = fwd_before > 0
+results["vm_traffic_blocked_after_enforcement"] = counter("leaked_forward") == fwd_before
+os.close(tun)
 results["preexisting_flow_had_leaked_before_enforcement"] = before_flow == 1
 results["preexisting_flow_blocked_after_enforcement"] = counter("leaked_udp_flow") == before_flow
 

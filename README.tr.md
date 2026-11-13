@@ -12,7 +12,7 @@ arayüzlü modern halefi.
 
 - Tüm TCP ve DNS trafiğini Tor'dan geçirir.
 - **Hata olursa kapalı kalır:** Tor'dan geçemeyen her şey (IPv6, diğer UDP, başlatmadan
-  önce açılmış bağlantılar) engellenir. Bir şey bozulursa trafik sızmaz, engelli kalır.
+  önce açılmış bağlantılar, sanal makine ve konteyner trafiği) engellenir. Bir şey bozulursa trafik sızmaz, engelli kalır.
 - **Temiz geri alınır:** yalnızca kendi güvenlik duvarı tablosuna dokunur. Stop, ağını
   tam eski haline döndürür. Mevcut güvenlik duvarı kuralların asla silinmez.
 - "Bağlı" yazısını yalnızca hem Tor'u hem güvenlik duvarını doğruladıktan sonra gösterir.
@@ -48,6 +48,8 @@ torwell-ui
 `"IsTor":true` göstermeli.
 
 ## Bilmen gerekenler
+
+Neyin korunup neyin korunmadığının tam listesi (İngilizce): [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 - **Tor tek başına seni anonim yapmaz.** Hesap girişlerin, tarayıcı parmak izin ve
   davranışların seni yine de tanıtabilir.
