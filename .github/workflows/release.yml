@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    # Built on an older glibc on purpose: the binaries then also run on newer distributions
+    # (Arch/CachyOS, Fedora, current Debian/Ubuntu). OpenTUI's native library is static.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: v
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v=0.0.0-dev; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "name=torwell-$v-x86_64-linux" >> "$GITHUB_OUTPUT"
+
+      - name: Bootstrap toolchain (Rust 1.99.1, Zig, pinned OpenTUI)
+        run: bash scripts/bootstrap-opentui.sh
+
+      - name: Build
+        run: |
+          . scripts/env-opentui.sh
+          for c in torwell-engine torwell-ui; do
+            cargo build --release --locked --manifest-path "crates/$c/Cargo.toml"
+          done
+
+      - name: Assemble
+        env:
+          NAME: ${{ steps.v.outputs.name }}
+        run: |
+          d="dist/$NAME"
+          install -Dm755 crates/torwell-engine/target/release/torwell-engine "$d/bin/torwell-engine"
+          install -Dm755 crates/torwell-ui/target/release/torwell-ui "$d/bin/torwell-ui"
+          strip "$d/bin/torwell-engine" "$d/bin/torwell-ui"
+          install -Dm644 packaging/polkit/org.torwell.engine.policy \
+            "$d/share/polkit-1/actions/org.torwell.engine.policy"
+          install -Dm644 README.md "$d/README.md"
+          install -Dm755 install.sh "$d/install.sh"
+          [ -f LICENSE ] && install -Dm644 LICENSE "$d/LICENSE" || true
+          tar -C dist --owner=0 --group=0 --numeric-owner -czf "dist/$NAME.tar.gz" "$NAME"
+          (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" && cat "$NAME.tar.gz.sha256")
+
+      - name: Smoke test
+        env:
+          NAME: ${{ steps.v.outputs.name }}
+        run: |
+          b="dist/$NAME/bin"
+          "$b/torwell-engine" --version
+          out=$(echo '{"version":1,"command":"inspect"}' | "$b/torwell-engine")
+          echo "$out"
+          echo "$out" | grep -q '"status":"ok"'
+          ldd "$b/torwell-ui" "$b/torwell-engine"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.v.outputs.name }}
+          path: |
+            dist/${{ steps.v.outputs.name }}.tar.gz
+            dist/${{ steps.v.outputs.name }}.tar.gz.sha256
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ steps.v.outputs.name }}.tar.gz
+            dist/${{ steps.v.outputs.name }}.tar.gz.sha256
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

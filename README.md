@@ -61,6 +61,25 @@ The UI never invokes a shell and never fabricates a connected state: a missing e
 reported as `engine_unavailable`, not as "protected". Details in
 [docs/UI.md](docs/UI.md) and [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
+## Install
+
+Linux x86_64. Installs `tor`, `nftables` and `polkit` with your package manager, then the
+release binaries (SHA-256 checked) and the polkit policy:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/se7enbyte/torwell/main/install.sh | sh
+torwell-ui
+```
+
+Uninstall (refuses while Torwell is active, so you are never left offline):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/se7enbyte/torwell/main/install.sh | sh -s -- --uninstall
+```
+
+While Torwell is active, LAN traffic is blocked too (VPN apps, Deskflow/KVM sharing,
+printers, NAS).
+
 ## Building
 
 The toolchain and the pinned OpenTUI native library are project-local under `.tooling/`
