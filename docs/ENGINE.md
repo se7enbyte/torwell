@@ -27,6 +27,11 @@ echo '{"version":1,"command":"inspect"}' | torwell-engine
 ```
 
 Read-only commands run unprivileged and never mutate: `inspect`, `status`, `plan`; mutating commands always require root: `start`, `stop`, `switch`, `recover`.
+Exception: when persisted state shows an active session (starting/connected/blocked), an
+unprivileged `status` is elevated the same way to run the root-only, read-only live check
+(nft read-back + Tor control socket); otherwise an active session could only ever show as
+"starting". If the prompt is declined or fails, the unprivileged answer is returned (never
+`connected`). The UI allows 2 minutes for `status` and 16 minutes for mutating commands.
 
 ## Privilege flow
 For a mutating request with a non-zero effective uid (`src/privilege.rs`):

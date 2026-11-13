@@ -527,11 +527,11 @@ fn q_quits_and_timeout_is_reported() {
             Duration::from_millis(150),
         )),
     );
-    select(&app, STATUS);
+    // Inspect keeps the short read-only limit (status may wait for a polkit prompt).
     app.press("enter");
     wait_idle(&app, &dash);
     assert!(
-        app.text().contains("status failed (timeout)"),
+        app.text().contains("inspect failed (timeout)"),
         "{}",
         app.text()
     );

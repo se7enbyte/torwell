@@ -32,6 +32,10 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Killing a start midway would leave the block applied with Tor not ready.
 pub const MUTATING_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 
+/// Limit for status: the engine may ask polkit for the root-only live check of an active
+/// session, so a password prompt must fit.
+pub const STATUS_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn limit_for(request: &[u8], read_only: Duration) -> Duration {
     match torwell_protocol::decode_request(request).map(|r| r.command) {
         Ok(
@@ -40,6 +44,7 @@ fn limit_for(request: &[u8], read_only: Duration) -> Duration {
             | torwell_protocol::Command::Switch(_)
             | torwell_protocol::Command::Recover,
         ) => MUTATING_TIMEOUT.max(read_only),
+        Ok(torwell_protocol::Command::Status) => STATUS_TIMEOUT.max(read_only),
         _ => read_only,
     }
 }
@@ -364,7 +369,7 @@ mod tests {
         use torwell_protocol::{encode_request, Command, Request};
         let short = Duration::from_millis(150);
         let enc = |c| encode_request(&Request::new(c)).unwrap();
-        assert_eq!(limit_for(&enc(Command::Status), short), short);
+        assert_eq!(limit_for(&enc(Command::Status), short), STATUS_TIMEOUT);
         assert_eq!(limit_for(&enc(Command::Inspect), short), short);
         assert_eq!(limit_for(&enc(Command::Stop), short), MUTATING_TIMEOUT);
         assert_eq!(limit_for(&enc(Command::Recover), short), MUTATING_TIMEOUT);

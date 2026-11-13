@@ -11,7 +11,8 @@ use crate::ops::Ops;
 use crate::privilege::Escalator;
 use crate::reply::{clean, error, error_reply, finalize, Reply};
 
-/// Commands that change host state. Only these may ever be elevated.
+/// Commands that change host state. These always need root. (`status` is additionally
+/// elevated, read-only, when an active session needs a live check; see `handle_bytes`.)
 pub fn is_mutating(command: &Command) -> bool {
     matches!(
         command,
@@ -43,7 +44,34 @@ pub fn handle_bytes(
             Err(e) => finalize(Response::err(e)),
         };
     }
+    if matches!(request.command, Command::Status)
+        && ops.euid() != 0
+        && allow_escalate
+        && live_check_applies(ops)
+    {
+        // Read-only, but the live check (nft read-back, Tor control socket) needs root.
+        // Without it an active session can only ever show as "starting". polkit's
+        // auth_admin_keep caches the password, so repeated refreshes do not re-prompt.
+        if let Ok(reply) = escalator.escalate(input) {
+            let ok = torwell_protocol::decode_response(&reply.stdout)
+                .map(|r| r.result.is_ok())
+                .unwrap_or(false);
+            if ok {
+                return reply;
+            }
+        }
+        // Declined, polkit missing or the elevated check failed: fall back to the honest
+        // unprivileged answer, which never claims connected.
+    }
     finalize(handle(ops, &request))
+}
+
+/// Whether persisted state describes a session whose live state only root can verify.
+fn live_check_applies(ops: &mut dyn Ops) -> bool {
+    matches!(
+        ops.status().map(|s| s.state),
+        Ok(State::Starting | State::Connected | State::Blocked { .. })
+    )
 }
 
 /// Dispatches a decoded request. Mutating commands are refused here unless root, so this
@@ -492,6 +520,59 @@ pub(crate) mod tests {
         let s = resp.result.unwrap();
         assert_eq!(s.phase, Phase::Starting);
         assert!(!fake.calls.contains(&"inspect_live"));
+    }
+
+    #[test]
+    fn unprivileged_status_of_an_active_session_asks_root_for_the_live_check() {
+        let mut fake = Fake::new(1000);
+        fake.status = Ok(Status {
+            state: State::Connected,
+            tor_uid: Some(970),
+            mac: None,
+        });
+        let child = finalize(Response::ok(EngineState {
+            phase: Phase::Disconnected,
+            ..EngineState::unknown()
+        }));
+        let esc = SpyEscalator {
+            answer: Some(child),
+            ..Default::default()
+        };
+        let (resp, _) = run(Command::Status, &mut fake, &esc);
+        assert_eq!(
+            resp.result.unwrap().phase,
+            Phase::Disconnected,
+            "child reply used"
+        );
+        assert_eq!(esc.seen.borrow().len(), 1);
+        assert!(
+            !fake.calls.contains(&"inspect_live"),
+            "parent never checks live itself"
+        );
+    }
+
+    #[test]
+    fn status_is_not_elevated_when_idle_or_when_elevation_is_disabled() {
+        let esc = SpyEscalator::default();
+        let mut fake = Fake::new(1000);
+        fake.status = Ok(Status {
+            state: State::Idle,
+            tor_uid: None,
+            mac: None,
+        });
+        run(Command::Status, &mut fake, &esc);
+        assert!(esc.seen.borrow().is_empty());
+
+        let mut fake = Fake::new(1000);
+        fake.status = Ok(Status {
+            state: State::Connected,
+            tor_uid: Some(970),
+            mac: None,
+        });
+        let reply = handle_bytes(&bytes(Command::Status), &mut fake, &esc, false);
+        let resp = decode_response(&reply.stdout).unwrap();
+        assert_eq!(resp.result.unwrap().phase, Phase::Starting);
+        assert!(esc.seen.borrow().is_empty());
     }
 
     #[test]

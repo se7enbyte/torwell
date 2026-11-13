@@ -76,7 +76,9 @@ Unix `ControlSocket` plus cookie auth (no TCP ControlPort). Socket and cookie mu
 These are kernel-policy tests; nothing about anonymity is proven.
 
 * `tests/real_tor.rs` (opt-in, `TORWELL_TEST_TOR=/path/to/tor`): torwell's own rendered torrc run by a **real** Tor (0.4.9.16 from the official expert bundle, SHA-256 checked) inside `unshare -Urn` with only `lo`, so it cannot reach the Tor network. Passed: `tor --verify-config` accepts the torrc; `SystemEnv` cookie read + Unix control socket + `AUTHENTICATE`; `net/listeners/{socks,trans,dns}` are exactly `"127.0.0.1:<port>"`; `process/pid` is the tor process and its uids match; `status/bootstrap-phase` parses (`PROGRESS=0 TAG=starting`); `SIGNAL NEWNYM` -> `250 OK`; a cookie with the wrong owner is refused. (`DisableNetwork 1` is unusable for this: Tor then opens no client listeners.)
-* Not yet: a full bootstrap to 100% over the real network, and Tor + the nft ruleset together end to end.
+* **First real end-to-end run (2026-11-13, CachyOS, Tor 0.4.9.16 from the distro, engine installed in /usr/bin, elevated through pkexec/polkit):** start applied the block, Tor bootstrapped to 100%, `check.torproject.org/api/ip` returned `"IsTor":true` from an exit relay, an IPv6 request failed to connect, and stop restored direct networking. An earlier attempt failed because the Tor unit required the optional restore unit; the failure left the verified block in place (`Blocked`, read-back verified) and stop recovered, as designed.
+* Expected Tor warning while active: `Rejecting request for anonymous connection to private address ... on a TransPort. Possible loop in your NAT rules?` A local program tried a LAN/private address; the rules send it to Tor and Tor refuses private destinations. This is the "LAN is blocked while active" policy, not a loop (the Tor uid is exempt).
+* Not yet: boot protection across a real reboot, MAC change on real hardware, NetworkManager/firewalld/docker coexistence.
 
 ## Tor control spec check
 

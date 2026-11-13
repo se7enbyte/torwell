@@ -8,9 +8,10 @@ Its goal is to route all system TCP and DNS traffic through Tor, block everythin
 own nftables table and its own durable state, and never flushes or rewrites anybody
 else's rules.
 
-**Status: early development.** The kernel firewall policy has been tested in network
-namespaces, but Torwell has **not** been run end to end with a real Tor process. Nothing
-here is a working product yet, and no anonymity claim is made.
+**Status: early development.** On CachyOS it has run end to end once: start through
+pkexec/polkit, Tor bootstrapped to 100%, check.torproject.org reported `IsTor: true`, IPv6
+was blocked and stop restored the network. Reboot protection, MAC change on real hardware
+and other distributions are not tested yet. No anonymity claim is made.
 
 ## Goals
 
@@ -39,7 +40,7 @@ and [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
 | Platform | Status | Notes |
 |---|---|---|
-| Linux (Arch/CachyOS first) | In development | nftables policy tested in network namespaces (`unshare -Urn`); not yet tested end to end with real Tor |
+| Linux (Arch/CachyOS first) | In development, works end to end on CachyOS | nftables policy tested with real packets in namespaces; real start/stop with Tor verified once on CachyOS |
 | Windows | Code exists, **not supported** | Never run on Windows; portable tests pass on Linux and the Win32 code type-checks, nothing more |
 | macOS | Out of scope | — |
 
