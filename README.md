@@ -2,6 +2,11 @@
 
 A modern, fail-closed Tor traffic router in Rust, with an OpenTUI terminal interface.
 
+![Torwell connected on CachyOS: Tor bootstrap and nftables enforcement verified](docs/screenshots/connected.png)
+
+*Connected on CachyOS: Tor bootstrap and the nftables block are both verified live. The
+animation turns green only with that evidence.*
+
 Torwell is a planned successor to [TorGhost](https://github.com/SusmithKrishnan/torghost).
 Its goal is to route all system TCP and DNS traffic through Tor, block everything else
 (including IPv6 and any direct fallback), and be cleanly reversible: it touches only its
