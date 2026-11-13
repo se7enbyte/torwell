@@ -71,4 +71,4 @@ Nasıl çalıştığı, kaynaktan derleme ve test ayrıntıları (İngilizce):
 
 ## Lisans
 
-Henüz seçilmedi.
+[GPL-3.0-or-later](LICENSE).

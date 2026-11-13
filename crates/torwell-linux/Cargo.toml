@@ -2,6 +2,7 @@
 name = "torwell-linux"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 description = "Linux (nftables + dedicated Tor service) executor library for torwell"
 publish = false
 

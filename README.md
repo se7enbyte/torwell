@@ -71,4 +71,4 @@ How it works, building from source and test details:
 
 ## License
 
-Not chosen yet.
+[GPL-3.0-or-later](LICENSE).

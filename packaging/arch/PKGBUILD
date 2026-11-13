@@ -3,7 +3,7 @@ pkgname=torwell
 pkgver=0.1.0
 pkgrel=1
 arch=(x86_64)
-license=('unknown') # TBD
+license=('GPL-3.0-or-later')
 depends=(tor nftables polkit systemd)
 optdepends=('networkmanager: optional MAC randomization')
 makedepends=(rust cargo zig git)
@@ -46,6 +46,7 @@ package() {
     "$pkgdir/usr/share/polkit-1/actions/org.torwell.engine.policy"
 
   install -Dm644 "README.md" "$pkgdir/usr/share/doc/torwell/README.md"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/torwell/LICENSE"
   for f in docs/*.md; do
     [[ -e "$f" ]] || continue
     install -Dm644 "$f" "$pkgdir/usr/share/doc/torwell/$(basename "$f")"

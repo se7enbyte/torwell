@@ -2,6 +2,7 @@
 name = "torwell-core"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 description = "Platform-neutral policy, MAC, lifecycle and inert plan core for torwell"
 publish = false
 
