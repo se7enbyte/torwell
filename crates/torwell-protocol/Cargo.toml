@@ -1,0 +1,12 @@
+[package]
+name = "torwell-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Versioned, typed UI <-> engine request/response contract for torwell (JSON over stdin/stdout)"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Validated core Config, MacMode and capability Support are reused, not redefined.
+torwell-core = { path = "../torwell-core" }

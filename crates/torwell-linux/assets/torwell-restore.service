@@ -1,0 +1,17 @@
+[Unit]
+Description=Restore torwell fail-closed nftables policy
+DefaultDependencies=no
+After=local-fs.target
+# nftables.service / firewalld load their own ruleset at boot; nftables.conf usually starts
+# with `flush ruleset`, which would delete the restored table if it ran afterwards.
+After=nftables.service firewalld.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=@TORWELL_ENGINE@ restore-at-boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+# Managed by torwell-linux. Regenerated on every start; do not edit.
+DataDirectory /var/lib/torwell-tor
+SocksPort 127.0.0.1:@SOCKS_PORT@
+TransPort 127.0.0.1:@TRANS_PORT@
+DNSPort 127.0.0.1:@DNS_PORT@
+AutomapHostsOnResolve 1
+VirtualAddrNetworkIPv4 10.192.0.0/10
+ControlSocket @RUNTIME_DIR@/control
+CookieAuthentication 1
+CookieAuthFile @RUNTIME_DIR@/control.authcookie
+CookieAuthFileGroupReadable 0
+SafeLogging 1
+Log notice stderr

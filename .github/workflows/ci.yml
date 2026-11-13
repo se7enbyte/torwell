@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crates:
+    name: ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Standalone crates (no workspace): each is built/tested via --manifest-path.
+        crate:
+          - torwell-core
+          - torwell-protocol
+          - torwell-linux
+          - torwell-windows
+        include:
+          # torwell-engine lands later; matrix entry is optional (see step conditions).
+          - crate: torwell-engine
+            optional: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/${{ matrix.crate }}
+      - name: cargo fmt --check
+        if: ${{ !matrix.optional || hashFiles('crates/torwell-engine/Cargo.toml') != '' }}
+        run: cargo fmt --manifest-path crates/${{ matrix.crate }}/Cargo.toml -- --check
+      - name: cargo clippy
+        if: ${{ !matrix.optional || hashFiles('crates/torwell-engine/Cargo.toml') != '' }}
+        run: cargo clippy --manifest-path crates/${{ matrix.crate }}/Cargo.toml --all-targets -- -D warnings
+      # torwell-linux/tests/kernel_policy.rs shells out to unshare/nft; nft isn't on
+      # the runner image by default. GitHub-hosted runners may also deny
+      # unprivileged user namespaces (unshare -Urn) -- the test skips itself then.
+      - name: Install nftables (linux netns tests)
+        if: ${{ matrix.crate == 'torwell-linux' }}
+        run: sudo apt-get update && sudo apt-get install -y nftables
+      - name: cargo test
+        if: ${{ !matrix.optional || hashFiles('crates/torwell-engine/Cargo.toml') != '' }}
+        run: cargo test --manifest-path crates/${{ matrix.crate }}/Cargo.toml
+
+  windows-check:
+    name: torwell-windows cross-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/torwell-windows
+      - name: cargo check (windows-gnu)
+        run: cargo check --manifest-path crates/torwell-windows/Cargo.toml --target x86_64-pc-windows-gnu
+
+  # torwell-ui depends on OpenTUI via a path dependency into .tooling/src/opentui,
+  # which is gitignored. Building it requires scripts/bootstrap-opentui.sh to fetch
+  # Zig 0.17.0 + the pinned OpenTUI source and build a native lib (plus a PTY smoke
+  # test). That is best-effort in CI, so this job is marked continue-on-error.
+  ui:
+    name: torwell-ui (best effort)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap OpenTUI toolchain
+        run: bash scripts/bootstrap-opentui.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/torwell-ui
+      - name: Add rustfmt + clippy to project toolchain
+        run: |
+          . scripts/env-opentui.sh
+          rustup component add rustfmt clippy
+      - name: cargo fmt --check
+        run: |
+          . scripts/env-opentui.sh
+          cargo fmt --manifest-path crates/torwell-ui/Cargo.toml -- --check
+      - name: cargo clippy
+        run: |
+          . scripts/env-opentui.sh
+          cargo clippy --manifest-path crates/torwell-ui/Cargo.toml --all-targets -- -D warnings
+      - name: cargo test
+        run: |
+          . scripts/env-opentui.sh
+          cargo test --manifest-path crates/torwell-ui/Cargo.toml

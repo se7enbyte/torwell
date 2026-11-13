@@ -1,0 +1,22 @@
+_active_warning() {
+  if [ -e /var/lib/torwell/state.json ]; then
+    echo "WARNING: torwell state exists (/var/lib/torwell/state.json): its fail-closed"
+    echo "nftables block may still be active and would keep blocking all traffic after removal."
+    echo "Stop it first with torwell-ui (Stop / Recover). If the engine is already gone:"
+    echo "  sudo nft delete table inet torwell"
+    echo "  sudo systemctl stop torwell-tor.service"
+    echo "  sudo rm -r /var/lib/torwell"
+  fi
+}
+
+post_install() {
+  echo "torwell installed. Run: torwell-ui"
+  echo "Reboot protection is OFF. To keep the fail-closed block across reboots:"
+  echo "  sudo torwell-engine boot-protection enable"
+}
+
+pre_remove() {
+  _active_warning
+  # Removes only the unit torwell-engine wrote (marker-checked), then reloads systemd.
+  /usr/bin/torwell-engine boot-protection disable >/dev/null 2>&1 || true
+}

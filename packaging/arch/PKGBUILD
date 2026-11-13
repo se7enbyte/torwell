@@ -1,0 +1,53 @@
+# Local/dev PKGBUILD: builds from the repository root ($startdir/../..). Not AUR-ready.
+pkgname=torwell
+pkgver=0.1.0
+pkgrel=1
+arch=(x86_64)
+license=('unknown') # TBD
+depends=(tor nftables polkit systemd)
+optdepends=('networkmanager: optional MAC randomization')
+makedepends=(rust cargo zig git)
+source=()
+sha256sums=()
+install=torwell.install
+
+_root="$startdir/../.."
+
+prepare() {
+  cd "$_root"
+  # Idempotent: project-local Rust 1.99.1, Zig and the pinned OpenTUI native library
+  # under .tooling/ (no sudo, nothing global). Re-runs are cheap once built.
+  bash scripts/bootstrap-opentui.sh
+}
+
+build() {
+  cd "$_root"
+  if [[ -f scripts/env-opentui.sh ]]; then
+    # shellcheck source=/dev/null
+    . scripts/env-opentui.sh
+  fi
+  cargo build --release --locked --manifest-path "$_root/crates/torwell-ui/Cargo.toml"
+  if [[ -f "$_root/crates/torwell-engine/Cargo.lock" ]]; then
+    cargo build --release --locked --manifest-path "$_root/crates/torwell-engine/Cargo.toml"
+  else
+    cargo build --release --manifest-path "$_root/crates/torwell-engine/Cargo.toml"
+  fi
+}
+
+package() {
+  cd "$_root"
+  install -Dm755 "crates/torwell-ui/target/release/torwell-ui" "$pkgdir/usr/bin/torwell-ui"
+  install -Dm755 "crates/torwell-engine/target/release/torwell-engine" "$pkgdir/usr/bin/torwell-engine"
+
+  # No packaged torwell-restore.service: `torwell-engine boot-protection enable` renders it
+  # into /etc/systemd/system (where reboot_protection() looks) only when the user opts in.
+
+  install -Dm644 "packaging/polkit/org.torwell.engine.policy" \
+    "$pkgdir/usr/share/polkit-1/actions/org.torwell.engine.policy"
+
+  install -Dm644 "README.md" "$pkgdir/usr/share/doc/torwell/README.md"
+  for f in docs/*.md; do
+    [[ -e "$f" ]] || continue
+    install -Dm644 "$f" "$pkgdir/usr/share/doc/torwell/$(basename "$f")"
+  done
+}

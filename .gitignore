@@ -1,0 +1,7 @@
+/target/
+/node_modules/
+/.tooling/
+.DS_Store
+
+# Rust build outputs, including standalone crates and spikes
+**/target/

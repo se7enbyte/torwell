@@ -1,0 +1,11 @@
+[package]
+name = "opentui-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Pinned upstream checkout (anomalyco/opentui dbebe5aa168ecc28f6772cfeb310e095f3b178b3), fetched by scripts/bootstrap-opentui.sh
+opentui = { path = "../../.tooling/src/opentui/packages/rust/crates/opentui" }

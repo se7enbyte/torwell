@@ -1,0 +1,20 @@
+[package]
+name = "torwell-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Unprivileged OpenTUI dashboard for torwell; talks to torwell-engine over the typed protocol"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "torwell-ui"
+path = "src/main.rs"
+
+[dependencies]
+# Same pinned native OpenTUI source as spikes/opentui-smoke (anomalyco/opentui dbebe5a).
+# Bootstrap: scripts/bootstrap-opentui.sh
+opentui = { path = "../../.tooling/src/opentui/packages/rust/crates/opentui" }
+torwell-core = { path = "../torwell-core" }
+torwell-protocol = { path = "../torwell-protocol" }

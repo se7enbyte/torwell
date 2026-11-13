@@ -1,0 +1,25 @@
+[package]
+name = "torwell-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Privilege-aware protocol engine for torwell: connects torwell-ui to the Linux backend"
+publish = false
+
+[lib]
+name = "torwell_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "torwell-engine"
+path = "src/main.rs"
+
+[dependencies]
+torwell-core = { path = "../torwell-core" }
+torwell-protocol = { path = "../torwell-protocol" }
+
+[target.'cfg(unix)'.dependencies]
+torwell-linux = { path = "../torwell-linux" }
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"

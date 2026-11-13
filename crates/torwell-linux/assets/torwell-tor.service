@@ -1,0 +1,38 @@
+# Managed by torwell-linux. Do not enable: torwell starts this unit only after its
+# nftables blocking table is installed and verified.
+[Unit]
+Description=Torwell dedicated Tor instance
+Documentation=man:tor(1)
+After=torwell-restore.service
+Requires=torwell-restore.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=torwell-tor
+Group=torwell-tor
+ExecStartPre=@TOR@ --verify-config -f @TORRC@
+ExecStart=@TOR@ --quiet -f @TORRC@
+# The nftables table keeps blocking while Tor restarts or is down.
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=torwell-tor
+RuntimeDirectoryMode=0700
+StateDirectory=torwell-tor
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
