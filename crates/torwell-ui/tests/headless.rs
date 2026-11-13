@@ -420,23 +420,76 @@ fn plan_is_sent_read_only_and_never_claims_connection() {
 }
 
 #[test]
-fn mac_toggle_is_refused_without_engine_validated_adapter() {
-    let app = TestApp::new(80, 24);
-    let (transport, _calls) = fake(|_| panic!("local toggle must not send"));
-    let _dash = build(&app, transport);
+fn mac_toggle_inspects_first_then_refuses_with_the_engine_reason() {
+    let app = TestApp::new(100, 24);
+    let (transport, calls) = fake(|req| {
+        assert!(
+            matches!(decode_request(req).unwrap().command, Command::Inspect),
+            "the toggle may only send the read-only inspect"
+        );
+        let mut s = state(Phase::Disconnected);
+        s.adapters = vec![AdapterInfo {
+            name: "virbr0".into(),
+            mac_change: Support::Unsupported,
+        }];
+        s.capabilities = vec![Capability {
+            name: "linux.mac.virbr0".into(),
+            support: Support::Unsupported,
+            detail: "virbr0 is a virtual device".into(),
+        }];
+        Ok(reply_with(s))
+    });
+    let dash = build(&app, transport);
     select(&app, MAC);
     app.press("enter");
+    wait_idle(&app, &dash);
+    assert_eq!(calls.lock().unwrap().len(), 1);
     let text = app.text();
     assert!(
         text.contains("MAC change unavailable: no adapter is validated by the engine"),
         "{text}"
     );
+    assert!(text.contains("virbr0: virbr0 is a virtual"), "{text}");
     assert!(text.contains("MAC mode    Off (default)"), "{text}");
 }
 
 #[test]
+fn mac_toggle_inspects_first_then_selects_the_supported_adapter() {
+    let app = TestApp::new(100, 24);
+    let (transport, calls) = fake(|_| {
+        let mut s = state(Phase::Disconnected);
+        s.adapters = vec![
+            AdapterInfo {
+                name: "enp37s0".into(),
+                mac_change: Support::Supported,
+            },
+            AdapterInfo {
+                name: "virbr0".into(),
+                mac_change: Support::Unsupported,
+            },
+        ];
+        Ok(reply_with(s))
+    });
+    let dash = build(&app, transport);
+    select(&app, MAC);
+    app.press("enter");
+    wait_idle(&app, &dash);
+    assert_eq!(calls.lock().unwrap().len(), 1, "one inspect, nothing else");
+    let text = app.text();
+    assert!(text.contains("MAC on enp37s0 (1/1)"), "{text}");
+    assert!(
+        text.contains("MAC mode    Random on apply, adapter enp37s0"),
+        "{text}"
+    );
+    // A second toggle is local (no new request) and turns MAC off again.
+    app.press("enter");
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert!(app.text().contains("MAC mode    Off (default)"));
+}
+
+#[test]
 fn mac_toggle_with_validated_adapter_then_start_sends_explicit_selection() {
-    let app = TestApp::new(80, 24);
+    let app = TestApp::new(100, 24);
     let (transport, calls) = fake(|req| {
         if decode_request(req)
             .map(|r| matches!(r.command, Command::Start(_)))
@@ -471,7 +524,7 @@ fn mac_toggle_with_validated_adapter_then_start_sends_explicit_selection() {
         "{text}"
     );
     assert!(
-        text.contains("Applies on the next start or switch."),
+        text.contains("MAC on eth0 (1/1): random on next Start"),
         "{text}"
     );
 

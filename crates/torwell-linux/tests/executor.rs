@@ -32,8 +32,15 @@ struct Sim {
     nm_type: &'static str,
     nm_profile: String,
     nm_effective: String,
+    /// What the device falls back to when the profile does not pin an address.
+    nm_original: String,
     nm_break_readback: bool,
     nm_fail_restore: bool,
+    nm_state: &'static str,
+    nm_unmanaged: bool,
+    /// DHCP send-hostname properties that exist on the profile, with their raw values.
+    nm_hostname: Vec<(String, String)>,
+    nm_hostname_ignored: bool,
 }
 
 type Shared = Rc<RefCell<Sim>>;
@@ -164,33 +171,75 @@ impl Runner for FakeRunner {
     }
 }
 
+const NM_UUID: &str = "11111111-2222-3333-4444-555555555555";
+
 fn nm(s: &mut Sim, a: &str) -> io::Result<Output> {
     if a == "-t -g RUNNING general" {
         return ok("running\n");
     }
-    if a.starts_with("-t -g GENERAL.TYPE,GENERAL.STATE,GENERAL.CON-UUID device show") {
+    if a.starts_with("-t -g GENERAL.TYPE,GENERAL.STATE,GENERAL.CON-UUID,GENERAL.NM-MANAGED,GENERAL.HWADDR device show") {
         return ok(&format!(
-            "{}\n100 (connected)\n11111111-2222-3333-4444-555555555555\n",
-            s.nm_type
+            "{}\n{}\n{NM_UUID}\n{}\n{}\n",
+            s.nm_type,
+            s.nm_state,
+            if s.nm_unmanaged { "no" } else { "yes" },
+            s.nm_effective.replace(':', "\\:")
         ));
     }
-    if a.starts_with("-t -g 802-3-ethernet.cloned-mac-address connection show") {
+    if a.starts_with("-t -g 802-3-ethernet.cloned-mac-address connection show")
+        || a.starts_with("-t -g 802-11-wireless.cloned-mac-address connection show")
+    {
         return ok(&format!("{}\n", s.nm_profile.replace(':', "\\:")));
+    }
+    if let Some(rest) = a.strip_prefix("-t -g ") {
+        if let Some((prop, _)) = rest.split_once(" connection show uuid ") {
+            if prop.ends_with(".dhcp-send-hostname") {
+                return match s.nm_hostname.iter().find(|(p, _)| p == prop) {
+                    Some((_, v)) => ok(&format!("{v}\n")),
+                    None => exit(2, "", "Error: invalid field"),
+                };
+            }
+        }
     }
     if a.starts_with("-t -g GENERAL.HWADDR device show") {
         return ok(&format!("{}\n", s.nm_effective.replace(':', "\\:")));
     }
-    if let Some(rest) = a.strip_prefix("connection modify --temporary uuid 11111111-2222-3333-4444-555555555555 802-3-ethernet.cloned-mac-address") {
-        let v = rest.strip_prefix(' ').unwrap_or("").to_string();
+    if let Some(rest) = a.strip_prefix(&format!(
+        "connection modify --temporary uuid {NM_UUID} 802-3-ethernet.cloned-mac-address"
+    )) {
+        // `<mac> [<hostname-prop> <value>]...`; an empty MAC value leaves a double space.
+        let mut it = rest.strip_prefix(' ').unwrap_or("").split(' ');
+        let v = it.next().unwrap_or("").to_string();
         if s.nm_fail_restore && v != s.nm_profile && !v.contains(':') {
             return exit(1, "", "restore refused");
         }
         s.nm_profile = v;
+        while let (Some(prop), Some(val)) = (it.next(), it.next()) {
+            if s.nm_hostname_ignored {
+                continue;
+            }
+            // Ternary on 1.52+: no -> 0, yes -> 1, "" (reset) -> -1.
+            let raw = match val {
+                "no" => "0",
+                "yes" => "1",
+                _ => "-1",
+            };
+            let entry = s
+                .nm_hostname
+                .iter_mut()
+                .find(|(p, _)| p == prop)
+                .unwrap_or_else(|| panic!("modify of a property that does not exist: {prop}"));
+            entry.1 = raw.to_string();
+        }
         return ok("");
     }
-    if a.starts_with("connection up uuid 11111111-2222-3333-4444-555555555555 ifname") {
-        if !s.nm_break_readback && s.nm_profile.contains(':') {
-            s.nm_effective = s.nm_profile.clone();
+    if a.starts_with(&format!("connection up uuid {NM_UUID} ifname")) {
+        if !s.nm_break_readback {
+            s.nm_effective = if s.nm_profile.contains(':') {
+                s.nm_profile.clone()
+            } else {
+                s.nm_original.clone()
+            };
         }
         return ok("");
     }
@@ -312,6 +361,12 @@ fn fixture(name: &str) -> Fx {
         newnym_reply: "250 OK",
         nm_type: "ethernet",
         nm_effective: "00:11:22:33:44:55".into(),
+        nm_original: "00:11:22:33:44:55".into(),
+        nm_state: "100 (connected)",
+        nm_hostname: vec![
+            ("ipv4.dhcp-send-hostname".into(), "-1".into()),
+            ("ipv6.dhcp-send-hostname".into(), "-1".into()),
+        ],
         ..Sim::default()
     }));
     Fx { sim, root, paths }
@@ -850,18 +905,144 @@ fn failed_mac_rollback_is_recovery_required() {
 }
 
 #[test]
-fn mac_capability_is_unsupported_for_unknown_adapters_and_never_claims_supported() {
+fn mac_applies_also_stop_sending_dhcp_hostname_and_stop_restores_exactly() {
+    let fx = fixture("machost");
+    fx.backend().start(&mac_opts()).unwrap();
+    {
+        let s = fx.sim.borrow();
+        assert!(
+            s.nm_hostname.iter().all(|(_, v)| v == "0"),
+            "{:?}",
+            s.nm_hostname
+        );
+        assert_ne!(s.nm_effective, "00:11:22:33:44:55");
+    }
+    // One in-memory modification carries MAC and both hostname properties.
+    let log = fx.log();
+    let modify = log
+        .iter()
+        .find(|l| l.contains("connection modify"))
+        .unwrap();
+    assert!(modify.contains("--temporary"));
+    assert!(modify.contains("ipv4.dhcp-send-hostname no ipv6.dhcp-send-hostname no"));
+    assert!(fx.pos("connection modify") < fx.pos("connection up"));
+    // Prior values are in the durable record before the change.
+    let text = std::fs::read_to_string(fx.state_file()).unwrap();
+    assert!(text.contains("ipv4.dhcp-send-hostname") && text.contains("\"-1\""));
+    let out = fx.backend().stop(&StopOptions::default()).unwrap();
+    assert!(out.mac_restored);
+    let s = fx.sim.borrow();
+    assert!(
+        s.nm_hostname.iter().all(|(_, v)| v == "-1"),
+        "{:?}",
+        s.nm_hostname
+    );
+    assert_eq!(s.nm_profile, "");
+    assert_eq!(s.nm_effective, "00:11:22:33:44:55", "original MAC is back");
+}
+
+#[test]
+fn hostname_restore_keeps_explicit_prior_values_and_skips_missing_properties() {
+    let fx = fixture("machost2");
+    // Pre-1.52 style: boolean `yes` on ipv4 only; ipv6 property does not exist.
+    fx.sim.borrow_mut().nm_hostname = vec![("ipv4.dhcp-send-hostname".into(), "yes".into())];
+    fx.sim.borrow_mut().nm_profile = "permanent".into();
+    fx.backend().start(&mac_opts()).unwrap();
+    assert_eq!(fx.sim.borrow().nm_hostname[0].1, "0");
+    let modify = fx
+        .log()
+        .into_iter()
+        .find(|l| l.contains("connection modify"))
+        .unwrap();
+    assert!(!modify.contains("ipv6"), "{modify}");
+    fx.backend().stop(&StopOptions::default()).unwrap();
+    let s = fx.sim.borrow();
+    assert_eq!(s.nm_hostname[0].1, "1", "explicit yes restored as yes");
+    assert_eq!(s.nm_profile, "permanent");
+}
+
+#[test]
+fn hostname_still_sent_after_change_rolls_everything_back() {
+    let fx = fixture("machost3");
+    fx.sim.borrow_mut().nm_hostname_ignored = true;
+    let f = fx.backend().start(&mac_opts()).unwrap_err();
+    assert!(
+        matches!(
+            f.error,
+            Error::Mac {
+                rolled_back: true,
+                ..
+            }
+        ),
+        "{:?}",
+        f.error
+    );
+    assert!(matches!(f.state, State::Blocked { .. }));
+    assert!(!fx.ran("systemctl start"));
+    let s = fx.sim.borrow();
+    assert_eq!(s.nm_profile, "");
+    assert_eq!(s.nm_effective, "00:11:22:33:44:55");
+}
+
+#[test]
+fn mac_capability_reports_supported_only_for_managed_connected_physical_adapters() {
     let fx = fixture("maccap");
+    let t = Duration::from_secs(3);
+    let cap = |fx: &Fx, name: &str| fx.backend().mac_capability(name, t);
+    use torwell_core::Support::{Supported, Unsupported};
+
+    // The good case: managed ethernet with an active profile.
+    let c = cap(&fx, "eth0");
+    assert_eq!(c.support, Supported, "{}", c.detail);
+    fx.sim.borrow_mut().nm_type = "wifi";
+    assert_eq!(cap(&fx, "wlan0").support, Supported);
+
+    // Not physical ethernet/wifi.
     fx.sim.borrow_mut().nm_type = "wireguard";
-    let c = fx.backend().mac_capability("wg0", Duration::from_secs(1));
-    assert_eq!(c.support, torwell_core::Support::Unsupported);
+    assert_eq!(cap(&fx, "wg0").support, Unsupported);
+    fx.sim.borrow_mut().nm_type = "bridge";
+    assert_eq!(cap(&fx, "br0").support, Unsupported);
     fx.sim.borrow_mut().nm_type = "ethernet";
-    let c = fx.backend().mac_capability("eth0", Duration::from_secs(1));
-    assert_eq!(c.support, torwell_core::Support::Unknown);
+    for name in ["virbr0", "docker0", "veth1a2b", "br-1234", "tun0", "lo"] {
+        let c = cap(&fx, name);
+        assert_eq!(c.support, Unsupported, "{name}");
+        assert!(!c.detail.is_empty());
+    }
+
+    // Unmanaged, externally connected, not connected, no profile.
+    fx.sim.borrow_mut().nm_unmanaged = true;
+    let c = cap(&fx, "eth0");
+    assert_eq!(c.support, Unsupported);
+    assert!(c.detail.contains("not managed"), "{}", c.detail);
+    fx.sim.borrow_mut().nm_unmanaged = false;
+    fx.sim.borrow_mut().nm_state = "100 (connected (externally))";
+    let c = cap(&fx, "eth0");
+    assert_eq!(c.support, Unsupported);
+    assert!(c.detail.contains("externally"), "{}", c.detail);
+    fx.sim.borrow_mut().nm_state = "30 (disconnected)";
+    let c = cap(&fx, "eth0");
+    assert_eq!(c.support, Unsupported);
+    assert!(c.detail.contains("not connected"), "{}", c.detail);
+    fx.sim.borrow_mut().nm_state = "100 (connected)";
+
     assert!(
         !fx.ran("modify") && !fx.ran("connection up"),
         "discovery is read-only"
     );
+    assert!(
+        fx.log()
+            .iter()
+            .filter(|l| l.contains("nmcli"))
+            .all(|l| l.contains(" -t -g ")),
+        "only terse read-only queries"
+    );
+}
+
+#[test]
+fn supported_probe_is_three_bounded_commands() {
+    let fx = fixture("maccost");
+    fx.backend().mac_capability("eth0", Duration::from_secs(3));
+    assert_eq!(fx.log().len(), 3, "{:?}", fx.log());
 }
 
 // ---------- boot restore ----------

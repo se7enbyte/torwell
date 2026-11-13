@@ -46,6 +46,14 @@ pub enum MacProgress {
     Applied,
 }
 
+/// A DHCP "send hostname" property of the profile, with the raw value read before the change
+/// (`yes`/`no` on older NetworkManager, `-1`/`0`/`1` on 1.52+). Restored on stop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostnamePrior {
+    pub property: String,
+    pub prior: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MacRecord {
     pub connection_uuid: String,
@@ -54,6 +62,10 @@ pub struct MacRecord {
     pub restore: MacRestore,
     pub candidate: MacAddress,
     pub progress: MacProgress,
+    /// Hostname-sending properties disabled together with the MAC change. Absent in state
+    /// files written before this existed.
+    #[serde(default)]
+    pub hostname: Vec<HostnamePrior>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -150,7 +150,7 @@ pub fn plan_steps(sel: &Selection) -> Vec<String> {
     let c = &sel.config;
     let mac = match (c.mac, &sel.adapter) {
         (MacMode::RandomOnApply, Some(a)) => format!(
-            "5. Change the MAC of adapter {} through NetworkManager (temporary), read it back, roll back on mismatch.",
+            "5. Change the MAC of adapter {} through NetworkManager (temporary) and stop its DHCP hostname, read both back, roll back on mismatch.",
             a.name
         ),
         _ => "5. MAC address: unchanged (mode off).".to_string(),

@@ -16,13 +16,17 @@ use crate::ops::{Host, Ops};
 use crate::reply::clean;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(30);
-const INSPECT_CMD_TIMEOUT: Duration = Duration::from_secs(4);
-/// `inspect` must answer inside the UI's 10 s limit; stop probing adapters after this.
+/// Total time for one adapter's read-only NetworkManager probe (three `nmcli` calls, each
+/// limited to a third of this).
+const INSPECT_CMD_TIMEOUT: Duration = Duration::from_secs(3);
+/// `inspect` must answer inside the UI's 10 s limit; stop probing adapters after this, so
+/// the worst case is this plus one adapter probe, well under the limit.
 const INSPECT_BUDGET: Duration = Duration::from_secs(5);
 
 pub struct LinuxOps<R: Runner, E: Env> {
     backend: Backend<R, E>,
     net_dir: std::path::PathBuf,
+    route_file: std::path::PathBuf,
 }
 
 impl LinuxOps<SystemRunner, SystemEnv> {
@@ -36,7 +40,13 @@ impl<R: Runner, E: Env> LinuxOps<R, E> {
         Self {
             backend,
             net_dir: "/sys/class/net".into(),
+            route_file: "/proc/net/route".into(),
         }
+    }
+
+    pub fn with_route_file(mut self, file: impl Into<std::path::PathBuf>) -> Self {
+        self.route_file = file.into();
+        self
     }
 
     pub fn with_net_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
@@ -57,6 +67,32 @@ pub fn list_interfaces(net_dir: &Path) -> Vec<String> {
         .unwrap_or_default();
     names.sort();
     names
+}
+
+/// The interface carrying the IPv4 default route (lowest metric), from `/proc/net/route`.
+pub fn default_route_interface(route_file: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(route_file).ok()?;
+    text.lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            // Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+            let flags = u32::from_str_radix(f.get(3)?, 16).ok()?;
+            let metric: u32 = f.get(6)?.parse().ok()?;
+            let is_default = *f.get(1)? == "00000000" && *f.get(7)? == "00000000";
+            // RTF_UP (1) and RTF_GATEWAY (2).
+            (is_default && flags & 3 == 3).then(|| (metric, f[0].to_string()))
+        })
+        .min()
+        .map(|(_, iface)| iface)
+}
+
+/// Why `name` is a virtual device according to sysfs (its link resolves under
+/// `devices/virtual`), if it is.
+fn sysfs_virtual(net_dir: &Path, name: &str) -> bool {
+    std::fs::canonicalize(net_dir.join(name))
+        .map(|p| p.components().any(|c| c.as_os_str() == "virtual"))
+        .unwrap_or(false)
 }
 
 fn capability(name: String, support: Support, detail: &str) -> Capability {
@@ -89,21 +125,43 @@ impl<R: Runner, E: Env> Ops for LinuxOps<R, E> {
             };
             capabilities.push(capability(name, support, &item.detail));
         }
-        let mut adapters = Vec::new();
-        for name in list_interfaces(&self.net_dir)
-            .into_iter()
-            .take(MAX_LIST_ITEMS)
+        // The default-route adapter first: the UI offers the first supported adapter.
+        let mut names = list_interfaces(&self.net_dir);
+        if let Some(i) = default_route_interface(&self.route_file)
+            .and_then(|d| names.iter().position(|n| *n == d))
         {
-            let mac_change = if started.elapsed() > INSPECT_BUDGET {
-                Support::Unknown
+            let d = names.remove(i);
+            names.insert(0, d);
+        }
+        let mut adapters = Vec::new();
+        for name in names.into_iter().take(MAX_LIST_ITEMS) {
+            let cap = if started.elapsed() > INSPECT_BUDGET {
+                torwell_core::Capability {
+                    name: String::new(),
+                    support: Support::Unknown,
+                    detail: "not probed: inspect time budget used up".into(),
+                }
+            } else if sysfs_virtual(&self.net_dir, &name) {
+                torwell_core::Capability {
+                    name: String::new(),
+                    support: Support::Unsupported,
+                    detail: format!("{name} is a virtual device; only physical ethernet and wifi adapters are supported"),
+                }
             } else {
-                // Read-only NetworkManager discovery. The backend never reports `Supported`
-                // from discovery alone.
-                self.backend
-                    .mac_capability(&name, INSPECT_CMD_TIMEOUT)
-                    .support
+                // Read-only NetworkManager discovery (managed, ethernet/wifi, active
+                // profile). The post-apply read-back is still the real proof.
+                self.backend.mac_capability(&name, INSPECT_CMD_TIMEOUT)
             };
-            adapters.push(AdapterInfo { name, mac_change });
+            // The reason is reported next to the verdict, e.g. why an adapter is unsupported.
+            capabilities.push(capability(
+                format!("linux.mac.{name}"),
+                cap.support,
+                &cap.detail,
+            ));
+            adapters.push(AdapterInfo {
+                name,
+                mac_change: cap.support,
+            });
         }
         Host {
             capabilities,
@@ -147,6 +205,38 @@ impl<R: Runner, E: Env> Ops for LinuxOps<R, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_route_is_the_lowest_metric_default_gateway_entry() {
+        let f = std::env::temp_dir().join(format!("torwell-route-{}", std::process::id()));
+        std::fs::write(
+            &f,
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+             wlan0\t00000000\t0100A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+             enp1\t00000000\t0107A8C0\t0003\t0\t0\t20100\t00000000\t0\t0\t0\n\
+             eth9\t0007A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n",
+        )
+        .unwrap();
+        assert_eq!(default_route_interface(&f).as_deref(), Some("wlan0"));
+        std::fs::write(&f, "Iface\tDestination\n").unwrap();
+        assert_eq!(default_route_interface(&f), None);
+        assert_eq!(default_route_interface(&f.with_extension("missing")), None);
+    }
+
+    #[test]
+    fn virtual_devices_are_recognised_from_the_sysfs_link() {
+        let root = std::env::temp_dir().join(format!("torwell-sysfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let net = root.join("class/net");
+        std::fs::create_dir_all(&net).unwrap();
+        std::fs::create_dir_all(root.join("devices/virtual/net/virbr0")).unwrap();
+        std::fs::create_dir_all(root.join("devices/pci0000:00/net/enp1")).unwrap();
+        std::os::unix::fs::symlink("../../devices/virtual/net/virbr0", net.join("virbr0")).unwrap();
+        std::os::unix::fs::symlink("../../devices/pci0000:00/net/enp1", net.join("enp1")).unwrap();
+        assert!(sysfs_virtual(&net, "virbr0"));
+        assert!(!sysfs_virtual(&net, "enp1"));
+        assert!(!sysfs_virtual(&net, "missing"));
+    }
 
     #[test]
     fn interface_listing_skips_loopback_and_bad_names_and_is_sorted() {

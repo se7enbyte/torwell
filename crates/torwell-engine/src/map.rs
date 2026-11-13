@@ -193,13 +193,17 @@ fn live_state(
         );
     }
     if tor == Check::Passed && !was_blocked {
-        let (mac_v, note) = if st.mac.is_some() {
-            (
+        let (mac_v, note) = match &st.mac {
+            Some(m) => (
                 VerifyState::Passed,
-                " MAC read-back is from apply time (no live MAC check).",
-            )
-        } else {
-            (VerifyState::NotRun, "")
+                format!(
+                    " MAC on {} is {} (read back at apply time, no live MAC check){}.",
+                    m.interface,
+                    m.address,
+                    hostname_note(m)
+                ),
+            ),
+            None => (VerifyState::NotRun, String::new()),
         };
         let v = Verification {
             tor_bootstrap: VerifyState::Passed,
@@ -226,6 +230,14 @@ fn live_state(
 
 /// A successful `start`. The backend's own lifecycle already demanded evidence; it is
 /// checked again here so this layer cannot be the one that over-claims.
+fn hostname_note(m: &torwell_linux::MacApplied) -> &'static str {
+    if m.hostname_hidden {
+        "; DHCP hostname not sent"
+    } else {
+        ""
+    }
+}
+
 pub fn start_success(out: &StartOutcome, config: &Config, rp: RebootProtection) -> EngineState {
     let mac_on = config.mac == MacMode::RandomOnApply;
     let ev = out.evidence;
@@ -243,9 +255,18 @@ pub fn start_success(out: &StartOutcome, config: &Config, rp: RebootProtection) 
         && v.enforcement == VerifyState::Passed
         && (!mac_on || v.mac_readback == VerifyState::Passed);
     if proven {
+        let mac = match &out.mac {
+            Some(m) => format!(
+                " MAC on {} changed to {} (read back){}.",
+                m.interface,
+                m.address,
+                hostname_note(m)
+            ),
+            None => String::new(),
+        };
         with_diag(
             base(Phase::Connected, v, config.mac, rp),
-            "Tor bootstrap and nftables enforcement read-back passed.",
+            &format!("Tor bootstrap and nftables enforcement read-back passed.{mac}"),
             Some(rp),
         )
     } else {
@@ -325,7 +346,7 @@ pub fn failure(f: &OpFailure, verb: Verb, mac_mode: MacMode, rp: RebootProtectio
 /// A successful `stop` or `recover`.
 pub fn stopped(out: &StopOutcome, verb: Verb, rp: RebootProtection) -> EngineState {
     let text = format!(
-        "{} complete: Tor stopped, owned nftables table {}, MAC {}.",
+        "{} complete: Tor stopped, owned nftables table {}, MAC and DHCP hostname setting {}.",
         verb.word(),
         if out.table_removed {
             "removed"
@@ -416,6 +437,7 @@ mod tests {
         st.mac = Some(torwell_linux::MacApplied {
             interface: "wlan0".into(),
             address: torwell_core::MacAddress::from_candidate_bytes([1, 2, 3, 4, 5, 6]),
+            hostname_hidden: true,
         });
         let s = persisted_state(&st, Some(&live(Check::Passed, Check::Passed)), RP);
         assert_eq!(s.phase, Phase::Connected);

@@ -76,10 +76,11 @@ fn inspect_reports_reboot_capability_and_bounded_lists() {
         .iter()
         .any(|c| c.name == "linux.nftables"));
     assert!(state.adapters.iter().all(|a| a.name != "lo"));
-    // Discovery alone never claims a working MAC change.
+    // Virtual devices are never offered for MAC change, whatever NetworkManager says.
     assert!(state
         .adapters
         .iter()
+        .filter(|a| a.name.starts_with("virbr") || a.name.starts_with("docker"))
         .all(|a| a.mac_change != torwell_protocol::Support::Supported));
 }
 

@@ -109,6 +109,8 @@ impl Default for StopOptions {
 pub struct MacApplied {
     pub interface: String,
     pub address: MacAddress,
+    /// DHCP hostname sending was switched off alongside (and is restored with the MAC).
+    pub hostname_hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,6 +568,7 @@ impl<R: Runner, E: Env> Backend<R, E> {
                     .map(|m| MacApplied {
                         interface: m.restore.interface().to_string(),
                         address: m.candidate,
+                        hostname_hidden: !m.hostname.is_empty(),
                     }),
             }),
         }
@@ -692,12 +695,16 @@ impl<R: Runner, E: Env> Backend<R, E> {
         }
     }
 
-    /// Non-mutating MAC capability for an interface.
+    /// Non-mutating MAC capability for an interface: `Supported` when it is an NM-managed
+    /// physical ethernet/wifi device with an active profile (the post-apply read-back plus
+    /// rollback stays the real proof). `budget` is the total time for this adapter: the probe
+    /// runs three nmcli calls, each limited to a third of it.
     pub fn mac_capability(
         &mut self,
         interface: &str,
-        command_timeout: Duration,
+        budget: Duration,
     ) -> torwell_core::Capability {
+        let command_timeout = (budget / 3).max(Duration::from_millis(200));
         let nmcli = self.paths.binaries.nmcli.clone();
         if let Err(e) = check_trusted_exec(&nmcli, self.paths.trusted_owner) {
             return torwell_core::Capability {
@@ -879,6 +886,7 @@ impl<R: Runner, E: Env> Backend<R, E> {
             mac_applied = Some(MacApplied {
                 interface: rec.restore.interface().to_string(),
                 address: rec.candidate,
+                hostname_hidden: !rec.hostname.is_empty(),
             });
             mac_check = Check::Passed;
         }

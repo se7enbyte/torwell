@@ -9,7 +9,8 @@ use std::collections::VecDeque;
 use torwell_core::capability::{Os, Report, Support};
 use torwell_core::config::{Config, MacMode};
 use torwell_protocol::{
-    Adapter, Command, EngineState, ErrorKind, Phase, ProtocolError, Selection, VerifyState,
+    Adapter, AdapterInfo, Command, EngineState, ErrorKind, Phase, ProtocolError, Selection,
+    VerifyState,
 };
 
 /// How many recent messages are kept and shown.
@@ -153,6 +154,14 @@ pub struct Model {
     pub host: Report,
     pub config: Config,
     pub adapter: Option<String>,
+    /// Adapter list from the last Inspect (or any reply that carried one). It is kept across
+    /// other replies, which do not list adapters.
+    pub adapters: Vec<AdapterInfo>,
+    inspected: bool,
+    /// Per-adapter MAC verdict reasons from the last Inspect (`linux.mac.<adapter>`).
+    mac_notes: Vec<(String, String)>,
+    /// The MAC toggle ran Inspect first and continues when the reply arrives.
+    toggle_after_inspect: bool,
     pub link: Link,
     pub busy: Option<Action>,
     pub pending: Option<Action>,
@@ -166,6 +175,10 @@ impl Model {
             host,
             config: Config::default(),
             adapter: None,
+            adapters: Vec::new(),
+            inspected: false,
+            mac_notes: Vec::new(),
+            toggle_after_inspect: false,
             link: Link::NotQueried,
             busy: None,
             pending: None,
@@ -192,17 +205,20 @@ impl Model {
         }
     }
 
-    /// The first validated adapter (the engine reports `mac_change: supported` only after
-    /// read-back works). `None` otherwise, so MAC mode cannot be enabled on a guess.
+    /// Adapters the engine validated for MAC change (`mac_change: supported`: NetworkManager
+    /// managed ethernet/wifi with an active profile). The default-route adapter comes first.
+    pub fn validated_adapters(&self) -> Vec<String> {
+        self.adapters
+            .iter()
+            .filter(|a| a.mac_change == Support::Supported)
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// The first validated adapter, `None` when there is none, so MAC mode cannot be
+    /// enabled on a guess.
     pub fn validated_adapter(&self) -> Option<String> {
-        match &self.link {
-            Link::Reported(state) => state
-                .adapters
-                .iter()
-                .find(|a| a.mac_change == Support::Supported)
-                .map(|a| a.name.clone()),
-            _ => None,
-        }
+        self.validated_adapters().into_iter().next()
     }
 
     /// Handles a menu choice. Mutating actions need a second activation of the same action.
@@ -260,25 +276,64 @@ impl Model {
         Next::Send(action, command)
     }
 
+    /// Cycles MAC mode: off -> first validated adapter -> next validated adapter -> ... -> off.
+    /// Without an adapter list it first runs the read-only Inspect and continues on its reply.
     fn toggle_mac(&mut self) -> Next {
-        match self.config.mac {
-            MacMode::RandomOnApply => {
+        if !self.inspected {
+            if let Some(busy) = self.busy {
+                self.message(format!(
+                    "Busy: waiting for engine reply to {}.",
+                    busy.short()
+                ));
+                return Next::Done;
+            }
+            self.toggle_after_inspect = true;
+            self.busy = Some(Action::Inspect);
+            self.message("Reading adapters (read-only inspect) before choosing a MAC adapter...");
+            return Next::Send(Action::Inspect, Command::Inspect);
+        }
+        let supported = self.validated_adapters();
+        let current = self
+            .adapter
+            .as_ref()
+            .and_then(|a| supported.iter().position(|s| s == a));
+        let next = match (self.config.mac, current) {
+            (MacMode::Off, _) => supported.first().map(|a| (0, a.clone())),
+            (MacMode::RandomOnApply, Some(i)) => supported.get(i + 1).map(|a| (i + 1, a.clone())),
+            (MacMode::RandomOnApply, None) => None,
+        };
+        match next {
+            Some((i, name)) => {
+                self.config.mac = MacMode::RandomOnApply;
+                self.adapter = Some(name.clone());
+                let then = if i + 1 < supported.len() {
+                    "next adapter"
+                } else {
+                    "off"
+                };
+                self.message(format!(
+                    "MAC on {name} ({}/{}): random on next Start, DHCP hostname off. Toggle again: {then}. Stop restores.",
+                    i + 1,
+                    supported.len()
+                ));
+            }
+            None if self.config.mac == MacMode::RandomOnApply => {
                 self.config.mac = MacMode::Off;
                 self.adapter = None;
                 self.message("MAC mode off (default). No adapter is changed.");
             }
-            MacMode::Off => match self.validated_adapter() {
-                Some(name) => {
-                    self.config.mac = MacMode::RandomOnApply;
-                    self.adapter = Some(name.clone());
-                    self.message(format!(
-                        "MAC random-on-apply selected for {name}. Applies on the next start or switch."
-                    ));
-                }
-                None => self.message(
-                    "MAC change unavailable: no adapter is validated by the engine (engine unavailable or no read-back support).",
-                ),
-            },
+            None => {
+                let why: Vec<String> = self
+                    .mac_notes
+                    .iter()
+                    .take(2)
+                    .map(|(n, d)| format!("{n}: {d}"))
+                    .collect();
+                self.message(format!(
+                    "MAC change unavailable: no adapter is validated by the engine. {}",
+                    why.join(" | ")
+                ));
+            }
         }
         Next::Done
     }
@@ -292,13 +347,32 @@ impl Model {
         }
         match &reply.result {
             Ok(state) => {
+                if reply.action == Action::Inspect || !state.adapters.is_empty() {
+                    self.adapters = state.adapters.clone();
+                    self.inspected = true;
+                    self.mac_notes = state
+                        .capabilities
+                        .iter()
+                        .filter_map(|c| {
+                            let name = c.name.strip_prefix("linux.mac.")?;
+                            Some((name.to_string(), c.detail.clone()))
+                        })
+                        .collect();
+                }
                 let text = state.diagnostic.clone().unwrap_or_else(|| {
                     format!("{}: {}", reply.action.short(), phase_label(state.phase))
                 });
                 self.message(text);
                 self.link = Link::Reported(state.clone());
+                if std::mem::take(&mut self.toggle_after_inspect) && reply.action == Action::Inspect
+                {
+                    self.toggle_mac();
+                }
             }
             Err(error) => {
+                if std::mem::take(&mut self.toggle_after_inspect) {
+                    self.message("MAC toggle cancelled: adapters could not be read.");
+                }
                 self.message(format!(
                     "{} failed ({}): {}",
                     reply.action.short(),
@@ -367,10 +441,25 @@ impl Model {
                 ((text, tone), (protect, ptone), bootstrap)
             }
         };
-        let mac = match self.config.mac {
-            MacMode::Off => "Off (default)".to_string(),
-            MacMode::RandomOnApply => format!(
-                "Random on apply, adapter {}",
+        let engine_mac = match &self.link {
+            Link::Reported(st) => {
+                st.phase == Phase::Connected
+                    && st.mac_mode == MacMode::RandomOnApply
+                    && st.verification.mac_readback == VerifyState::Passed
+            }
+            _ => false,
+        };
+        let mac = match (self.config.mac, engine_mac) {
+            (_, true) => format!(
+                "Random MAC active{} (read-back passed); Stop restores the original",
+                self.adapter
+                    .as_deref()
+                    .map(|a| format!(" on {a}"))
+                    .unwrap_or_default()
+            ),
+            (MacMode::Off, false) => "Off (default)".to_string(),
+            (MacMode::RandomOnApply, false) => format!(
+                "Random on apply, adapter {} (applied on Start)",
                 self.adapter.as_deref().unwrap_or("none")
             ),
         };
@@ -518,5 +607,91 @@ mod mood_tests {
         let mut m = Model::new(detect(Os::Linux, |_| false));
         m.link = Link::Failed(ProtocolError::new(ErrorKind::EngineUnavailable, "x"));
         assert_eq!(m.mood(), Mood::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod toggle_tests {
+    use super::*;
+    use torwell_core::host::detect;
+
+    fn adapter(name: &str, s: Support) -> AdapterInfo {
+        AdapterInfo {
+            name: name.into(),
+            mac_change: s,
+        }
+    }
+
+    fn inspected_model() -> Model {
+        let mut m = Model::new(detect(Os::Linux, |_| false));
+        m.adapters = vec![
+            adapter("enp37s0", Support::Supported),
+            adapter("virbr0", Support::Unsupported),
+            adapter("wlan0", Support::Supported),
+        ];
+        m.inspected = true;
+        m
+    }
+
+    #[test]
+    fn toggle_cycles_supported_adapters_then_off_and_never_picks_unsupported() {
+        let mut m = inspected_model();
+        for want in [Some("enp37s0"), Some("wlan0"), None, Some("enp37s0")] {
+            assert_eq!(m.activate(Action::ToggleMac), Next::Done);
+            assert_eq!(m.adapter.as_deref(), want);
+            assert_eq!(
+                m.config.mac,
+                if want.is_some() {
+                    MacMode::RandomOnApply
+                } else {
+                    MacMode::Off
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_without_an_adapter_list_sends_only_inspect_and_continues_on_the_reply() {
+        let mut m = Model::new(detect(Os::Linux, |_| false));
+        assert_eq!(
+            m.activate(Action::ToggleMac),
+            Next::Send(Action::Inspect, Command::Inspect)
+        );
+        // Busy: a second toggle neither sends nor changes anything.
+        assert_eq!(m.activate(Action::ToggleMac), Next::Done);
+        assert_eq!(m.config.mac, MacMode::Off);
+        let mut st = EngineState::unknown();
+        st.phase = Phase::Disconnected;
+        st.adapters = vec![adapter("eth0", Support::Supported)];
+        m.apply(&EngineReply {
+            action: Action::Inspect,
+            result: Ok(st),
+            stderr: String::new(),
+        });
+        assert_eq!(m.adapter.as_deref(), Some("eth0"));
+        assert_eq!(m.config.mac, MacMode::RandomOnApply);
+    }
+
+    #[test]
+    fn failed_inspect_cancels_the_toggle_and_other_replies_keep_the_adapter_list() {
+        let mut m = Model::new(detect(Os::Linux, |_| false));
+        let _ = m.activate(Action::ToggleMac);
+        m.apply(&EngineReply {
+            action: Action::Inspect,
+            result: Err(ProtocolError::new(ErrorKind::Timeout, "slow")),
+            stderr: String::new(),
+        });
+        assert_eq!(m.config.mac, MacMode::Off);
+        assert!(m.messages().any(|t| t.contains("MAC toggle cancelled")));
+
+        let mut m = inspected_model();
+        let mut st = EngineState::unknown();
+        st.phase = Phase::Disconnected;
+        m.apply(&EngineReply {
+            action: Action::Status,
+            result: Ok(st),
+            stderr: String::new(),
+        });
+        assert_eq!(m.validated_adapters(), vec!["enp37s0", "wlan0"]);
     }
 }

@@ -9,7 +9,7 @@ let mut b = Backend::system();                    // or Backend::new(runner, env
 b.preflight(want_mac) -> PreflightReport          // read-only; runs `nft --version`, `tor --version`
 b.status() -> Result<Status, Error>               // persisted state; Active reported Starting (live state unknown)
 b.inspect_live(timeout) -> Result<LiveStatus, Error>   // root, non-mutating re-check
-b.mac_capability(iface, timeout) -> Capability    // read-only NM discovery; never "Supported"
+b.mac_capability(iface, timeout) -> Capability    // read-only NM probe (3 nmcli calls); Supported = eligible
 b.start(&StartOptions) -> Result<StartOutcome, OpFailure>
 b.stop(&StopOptions)    -> Result<StopOutcome, OpFailure>   // Active/Blocked only
 b.recover(&StopOptions) -> Result<StopOutcome, OpFailure>   // any non-idle state
@@ -55,7 +55,17 @@ Unix `ControlSocket` plus cookie auth (no TCP ControlPort). Socket and cookie mu
 
 ## MAC (optional, default off)
 
-`nmcli` argument arrays only. Supports NM-managed `ethernet`/`wifi` with an active profile; anything else fails in discovery before any mutation. Records prior `cloned-mac-address` policy (including absent) and pre-change address, then `connection modify --temporary` + `connection up`, reads back profile and device address, rolls back on mismatch. Candidate: `getrandom` bytes -> core `from_candidate_bytes` (locally administered unicast). Restore compares the profile read-back to the recorded policy. Limits: nmcli prints unset as empty so "absent" = empty; `random-bia`/`stable-bia` are rejected as unsupported; wifi and real adapters are untested; `--temporary` semantics are from `nmcli(1)` and untested.
+`nmcli` argument arrays only (run with `LC_ALL=C`, so field values are not localized; terse output is unescaped, so profile names with spaces or UTF-8 such as "Kablolu bağlantı 1" are not a problem because only UUIDs and interface names are passed).
+
+**Capability (Inspect).** `mac_capability` is read-only and reports `Supported` when: `nmcli` is trusted, NM is running, the device is `GENERAL.NM-MANAGED=yes`, `GENERAL.TYPE` is `ethernet` or `wifi`, the state is `100 (connected)` (not `connected (externally)`, not disconnected) and `GENERAL.CON-UUID` is a real profile. `lo`, bridges, `virbr*`, `docker*`, `veth*`, `tun*`/`tap*`/`wg*` and anything resolving under `/sys/devices/virtual` are `Unsupported` with a reason (reported as `linux.mac.<iface>` capabilities). `Supported` is only eligibility; the proof is the read-back after the change. The probe costs three `nmcli` calls with a total budget of 3 s per adapter, and the engine stops probing after 5 s, so `inspect` stays inside the UI's 10 s limit. The default-route adapter (from `/proc/net/route`) is listed first.
+
+**Apply.** The prior `cloned-mac-address` policy (including absent), the pre-change address and the prior `ipv4/ipv6.dhcp-send-hostname` values (only the properties that exist; `-1`/`0`/`1` on NM 1.52+, `yes`/`no` before) are recorded durably, then one `connection modify --temporary` sets the candidate MAC and both send-hostname properties to `no`, then `connection up`. Read-back: the profile reads the candidate, the hostname properties read `no`, and `GENERAL.HWADDR` equals the candidate (5 tries); any mismatch rolls back. Candidate: `getrandom` bytes -> core `from_candidate_bytes` (locally administered unicast).
+
+**Restore (Stop, rollback, recover).** `connection modify --temporary` back to the recorded policy (absent = empty value, which nmcli documents as "reset to default"; the hostname default `-1` is restored the same way), `connection up`, then the profile and hostname values are read back against the record, and for `preserve`/`permanent`/`stable`/explicit policies the device address is compared with the pre-change address.
+
+**`--temporary` semantics** (assumed from `nmcli(1)`/libnm, untested on hardware): the change lives in NetworkManager's memory only; the profile file on disk is not rewritten. An NM restart or `nmcli connection reload` while Torwell is active drops the change, and the next activation then uses the on-disk (original) MAC and hostname setting; nftables blocking stays in force. A restore with `--temporary` leaves the in-memory profile "unsaved" but equal to the original. Limits: nmcli prints unset as empty so "absent" = empty, and for an absent policy the final device address is not compared (a global NM default of `random` makes it unpredictable); `random-bia`/`stable-bia` are rejected as unsupported; wifi and real adapters are untested.
+
+**UI flow.** Inspect (or the MAC toggle, which runs Inspect itself the first time) -> `MAC mode: toggle` selects the first `Supported` adapter (the default-route one when it qualifies) and each further press cycles to the next supported adapter, then back to off -> Start (two Enters) sends `mac: random_on_apply` plus that adapter -> the engine applies after the nft block is verified -> Connected shows the new MAC and "DHCP hostname not sent" -> Stop restores.
 
 ## Boot restore
 

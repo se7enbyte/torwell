@@ -4,8 +4,20 @@
 //! only via `--temporary`), then the connection is re-activated, and both the profile value
 //! and the device's effective address are read back. The prior profile policy (including
 //! "absent") is recorded before the first modification and restored on failure or stop.
-//! Support is limited to NM-managed `ethernet` and `wifi` devices with an active profile;
-//! anything else fails during discovery, before any mutation. Real adapters are untested.
+//! Support is limited to NM-managed `ethernet` and `wifi` devices (not "connected
+//! externally", not virtual) with an active profile; anything else fails during discovery,
+//! before any mutation. Discovery is read-only and is what `capability` reports as
+//! `Supported`; the real proof is the read-back after the change, followed by a rollback
+//! when it does not match.
+//!
+//! While the change is active the DHCP client must not send the real hostname either, so
+//! `ipv4/ipv6.dhcp-send-hostname` are set to `no` in the same in-memory modification (only
+//! when the property exists) and restored to exactly what they were.
+//!
+//! `connection modify --temporary` changes the profile in NetworkManager's memory only: the
+//! file on disk is not rewritten, and an NM restart or `nmcli connection reload` drops the
+//! change (the device then returns to its prior policy on its next activation). Restoring
+//! also uses `--temporary`, so nothing of ours is ever written to disk.
 //!
 //! Limitation: nmcli prints an unset property as an empty string, and an empty string is
 //! not a valid value, so empty is recorded as `Absent`.
@@ -18,7 +30,7 @@ use torwell_core::{Capability, MacAddress, MacRestore, ProfileMac, Support};
 use crate::env::Env;
 use crate::error::Error;
 use crate::runner::{Cmd, Runner};
-use crate::state::{MacProgress, MacRecord};
+use crate::state::{HostnamePrior, MacProgress, MacRecord};
 
 pub struct Nm<'a> {
     pub runner: &'a mut dyn Runner,
@@ -34,6 +46,65 @@ pub struct MacTarget {
     pub uuid: String,
     pub prior: ProfileMac,
     pub effective: Option<MacAddress>,
+    /// DHCP send-hostname properties that exist on the profile, with their current values.
+    /// Only filled by the full (start-time) discovery.
+    pub hostname: Vec<HostnamePrior>,
+}
+
+/// DHCP "send hostname" properties. On NetworkManager 1.52+ they are ternary
+/// (`default`/`no`/`yes`, read as `-1`/`0`/`1`), before that boolean.
+const HOSTNAME_PROPS: [&str; 2] = ["ipv4.dhcp-send-hostname", "ipv6.dhcp-send-hostname"];
+
+/// Device names that are never a physical LAN adapter. The NM device type is checked too;
+/// this gives a clear reason first and protects against odd NM type reporting.
+const VIRTUAL_PREFIXES: [&str; 17] = [
+    "virbr",
+    "docker",
+    "veth",
+    "br-",
+    "tun",
+    "tap",
+    "wg",
+    "vnet",
+    "vboxnet",
+    "vmnet",
+    "lxc",
+    "podman",
+    "cni",
+    "flannel",
+    "tailscale",
+    "zt",
+    "dummy",
+];
+
+/// Why `name` is skipped as a virtual device, if it is one.
+pub fn virtual_reason(name: &str) -> Option<String> {
+    if name == "lo" {
+        return Some("loopback device".into());
+    }
+    VIRTUAL_PREFIXES
+        .iter()
+        .find(|p| name.starts_with(**p))
+        .map(|p| format!("{name} looks like a virtual device ({p}*); only physical ethernet and wifi adapters are supported"))
+}
+
+/// Canonical meaning of a send-hostname value across NM versions.
+fn hostname_flag(v: &str) -> &'static str {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "yes" | "true" | "on" | "1" => "yes",
+        "no" | "false" | "off" | "0" => "no",
+        _ => "default",
+    }
+}
+
+/// The value that puts `prior` back. The default (`-1`) is restored by resetting the
+/// property with an empty value, which is documented to mean "default".
+fn hostname_restore_value(prior: &str) -> &'static str {
+    match hostname_flag(prior) {
+        "yes" => "yes",
+        "no" => "no",
+        _ => "",
+    }
 }
 
 pub fn check_interface(name: &str) -> Result<(), Error> {
@@ -111,12 +182,16 @@ fn setting_for(kind: &str) -> Option<&'static str> {
 }
 
 impl<'a> Nm<'a> {
-    fn run(&mut self, what: &str, args: &[&str]) -> Result<String, Error> {
+    fn run_raw(&mut self, what: &str, args: &[&str]) -> Result<crate::runner::Output, Error> {
         let cmd = Cmd::new(self.nmcli, args, self.timeout);
-        let out = self.runner.run(&cmd).map_err(|e| Error::Command {
+        self.runner.run(&cmd).map_err(|e| Error::Command {
             what: what.into(),
             detail: e.to_string(),
-        })?;
+        })
+    }
+
+    fn run(&mut self, what: &str, args: &[&str]) -> Result<String, Error> {
+        let out = self.run_raw(what, args)?;
         if !out.ok() {
             return Err(Error::Command {
                 what: what.into(),
@@ -144,13 +219,35 @@ impl<'a> Nm<'a> {
         Ok(MacAddress::parse(&f[0]).ok())
     }
 
-    /// Read-only discovery. Fails for unknown, unmanaged, unsupported or unconnected adapters.
+    /// `None` when the profile has no such property (an nmcli exit status, e.g. an old
+    /// NetworkManager); a runner failure such as a timeout is an error, never "absent".
+    fn read_hostname_prop(&mut self, prop: &str, uuid: &str) -> Result<Option<String>, Error> {
+        let out = self.run_raw(
+            "nmcli connection show",
+            &["-t", "-g", prop, "connection", "show", "uuid", uuid],
+        )?;
+        if !out.ok() {
+            return Ok(None);
+        }
+        Ok(Some(parse_fields(&out.stdout, 1)?.remove(0)))
+    }
+
+    /// Read-only discovery for starting: everything needed to apply and to restore.
+    /// Fails for unknown, unmanaged, unsupported or unconnected adapters.
     pub fn discover(&mut self, iface: &str) -> Result<MacTarget, Error> {
+        self.probe(iface, true)
+    }
+
+    /// Cheap read-only discovery (three nmcli calls) for `capability`.
+    fn probe(&mut self, iface: &str, full: bool) -> Result<MacTarget, Error> {
         let fail = |d: String| Error::Mac {
             detail: d,
             rolled_back: true,
         };
         check_interface(iface)?;
+        if let Some(why) = virtual_reason(iface) {
+            return Err(fail(why));
+        }
         let running = self.run("nmcli general", &["-t", "-g", "RUNNING", "general"])?;
         if running.trim() != "running" {
             return Err(fail("NetworkManager is not running".into()));
@@ -160,21 +257,34 @@ impl<'a> Nm<'a> {
             &[
                 "-t",
                 "-g",
-                "GENERAL.TYPE,GENERAL.STATE,GENERAL.CON-UUID",
+                "GENERAL.TYPE,GENERAL.STATE,GENERAL.CON-UUID,GENERAL.NM-MANAGED,GENERAL.HWADDR",
                 "device",
                 "show",
                 iface,
             ],
         )?;
-        let f = parse_fields(&out, 3)?;
+        let f = parse_fields(&out, 5)?;
         let setting = setting_for(&f[0]).ok_or_else(|| {
             fail(format!(
-                "device type {:?} is unsupported (ethernet and wifi only)",
+                "device type {:?} is unsupported (physical ethernet and wifi only)",
                 f[0]
             ))
         })?;
+        if f[3] != "yes" {
+            return Err(fail(
+                "device is not managed by NetworkManager (unmanaged)".into(),
+            ));
+        }
+        if f[1].contains("externally") {
+            return Err(fail(
+                "device is only 'connected (externally)': no NetworkManager profile owns it".into(),
+            ));
+        }
         if !f[1].starts_with("100") {
-            return Err(fail(format!("device state {:?} is not connected", f[1])));
+            return Err(fail(format!(
+                "device state {:?} is not connected: activate its profile first",
+                f[1]
+            )));
         }
         if !check_uuid(&f[2]) {
             return Err(fail(
@@ -182,30 +292,56 @@ impl<'a> Nm<'a> {
             ));
         }
         let prior = self.read_profile(setting, &f[2])?;
-        let effective = self.read_effective(iface)?;
+        let effective = MacAddress::parse(&f[4]).ok();
+        let mut hostname = Vec::new();
+        if full {
+            for prop in HOSTNAME_PROPS {
+                if let Some(v) = self.read_hostname_prop(prop, &f[2])? {
+                    hostname.push(HostnamePrior {
+                        property: prop.to_string(),
+                        prior: v,
+                    });
+                }
+            }
+        }
         Ok(MacTarget {
             interface: iface.to_string(),
             setting,
             uuid: f[2].clone(),
             prior,
             effective,
+            hostname,
         })
     }
 
-    fn set_and_reactivate(&mut self, t: &MacRecord, iface: &str, value: &str) -> Result<(), Error> {
+    /// One in-memory modification (MAC policy and, when `suppress_hostname`, hostname
+    /// sending off; otherwise the recorded prior hostname values), then re-activation.
+    fn set_and_reactivate(
+        &mut self,
+        t: &MacRecord,
+        iface: &str,
+        value: &str,
+        suppress_hostname: bool,
+    ) -> Result<(), Error> {
         let prop = format!("{}.cloned-mac-address", t.setting);
-        self.run(
-            "nmcli connection modify",
-            &[
-                "connection",
-                "modify",
-                "--temporary",
-                "uuid",
-                &t.connection_uuid,
-                &prop,
-                value,
-            ],
-        )?;
+        let mut args: Vec<&str> = vec![
+            "connection",
+            "modify",
+            "--temporary",
+            "uuid",
+            &t.connection_uuid,
+            &prop,
+            value,
+        ];
+        for h in &t.hostname {
+            args.push(&h.property);
+            args.push(if suppress_hostname {
+                "no"
+            } else {
+                hostname_restore_value(&h.prior)
+            });
+        }
+        self.run("nmcli connection modify", &args)?;
         self.run(
             "nmcli connection up",
             &[
@@ -220,13 +356,40 @@ impl<'a> Nm<'a> {
         Ok(())
     }
 
-    /// Restores the recorded prior policy and verifies the profile reads back as recorded.
-    /// When the prior policy yields a predictable address, the effective address is checked too.
+    /// Properties whose current value differs from what `want` says (`None` = prior value).
+    fn hostname_mismatch(
+        &mut self,
+        rec: &MacRecord,
+        suppressed: bool,
+    ) -> Result<Option<String>, Error> {
+        for h in &rec.hostname {
+            let now = self
+                .read_hostname_prop(&h.property, &rec.connection_uuid)?
+                .ok_or_else(|| Error::Mac {
+                    detail: format!("{} cannot be read back", h.property),
+                    rolled_back: false,
+                })?;
+            let want = if suppressed {
+                "no"
+            } else {
+                hostname_flag(&h.prior)
+            };
+            if hostname_flag(&now) != want {
+                return Ok(Some(format!("{} reads {now:?}", h.property)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Restores the recorded prior policy (MAC and hostname sending) and verifies it reads
+    /// back as recorded. When the prior policy yields a predictable address, the effective
+    /// address is checked too.
     pub fn restore(&mut self, rec: &MacRecord) -> Result<(), Error> {
         let iface = rec.restore.interface().to_string();
         let prior = rec.restore.restore_profile().clone();
-        if self.read_profile(&rec.setting, &rec.connection_uuid)? != prior {
-            self.set_and_reactivate(rec, &iface, &profile_value(&prior))?;
+        let profile_differs = self.read_profile(&rec.setting, &rec.connection_uuid)? != prior;
+        if profile_differs || self.hostname_mismatch(rec, false)?.is_some() {
+            self.set_and_reactivate(rec, &iface, &profile_value(&prior), false)?;
         }
         let now = self.read_profile(&rec.setting, &rec.connection_uuid)?;
         if now != prior {
@@ -235,9 +398,18 @@ impl<'a> Nm<'a> {
                 rolled_back: false,
             });
         }
+        if let Some(bad) = self.hostname_mismatch(rec, false)? {
+            return Err(Error::Mac {
+                detail: format!("{bad} after restore"),
+                rolled_back: false,
+            });
+        }
         let predictable = matches!(
             prior,
-            ProfileMac::Preserve | ProfileMac::Permanent | ProfileMac::Explicit(_)
+            ProfileMac::Preserve
+                | ProfileMac::Permanent
+                | ProfileMac::Stable
+                | ProfileMac::Explicit(_)
         );
         if let (true, Some(expect)) = (predictable, rec.restore.prior_effective()) {
             if self.read_effective(&iface)? != Some(expect) {
@@ -268,14 +440,21 @@ impl<'a> Nm<'a> {
             restore,
             candidate,
             progress: MacProgress::Pending,
+            hostname: t.hostname.clone(),
         };
         persist(&rec)?;
         let attempt = (|| -> Result<(), Error> {
-            self.set_and_reactivate(&rec, &t.interface, &candidate.to_string())?;
+            self.set_and_reactivate(&rec, &t.interface, &candidate.to_string(), true)?;
             let profile = self.read_profile(t.setting, &t.uuid)?;
             if profile != ProfileMac::Explicit(candidate) {
                 return Err(Error::Mac {
                     detail: format!("profile reads {profile:?}, expected the candidate"),
+                    rolled_back: false,
+                });
+            }
+            if let Some(bad) = self.hostname_mismatch(&rec, true)? {
+                return Err(Error::Mac {
+                    detail: format!("DHCP hostname sending is still on: {bad}"),
                     rolled_back: false,
                 });
             }
@@ -312,16 +491,19 @@ impl<'a> Nm<'a> {
     }
 }
 
-/// Non-mutating capability report for `interface`.
+/// Non-mutating capability report for `interface`. `Supported` means: NM runs, the device is
+/// NM-managed physical ethernet or wifi with an active profile. The post-apply read-back
+/// plus rollback remain the actual proof.
 pub fn capability(nm: &mut Nm, interface: &str) -> Capability {
-    let (support, detail) = match nm.discover(interface) {
+    let (support, detail) = match nm.probe(interface, false) {
         Ok(t) => (
-            Support::Unknown,
+            Support::Supported,
             format!(
-                "{} on {} is eligible; real adapter behaviour is untested",
+                "{} on {}: NetworkManager profile active; change is verified by read-back and rolled back on mismatch",
                 t.setting, t.interface
             ),
         ),
+        Err(Error::Mac { detail, .. }) => (Support::Unsupported, detail),
         Err(e) => (Support::Unsupported, e.to_string()),
     };
     Capability {
@@ -370,5 +552,41 @@ mod tests {
         }
         assert!(check_uuid("11111111-2222-3333-4444-555555555555"));
         assert!(!check_uuid("--") && !check_uuid("11111111-2222-3333-4444-55555555555g"));
+    }
+
+    #[test]
+    fn hostname_values_normalise_across_nm_versions_and_restore_the_default_by_reset() {
+        for (v, flag, restore) in [
+            ("-1", "default", ""),
+            ("default", "default", ""),
+            ("", "default", ""),
+            ("0", "no", "no"),
+            ("no", "no", "no"),
+            ("1", "yes", "yes"),
+            ("yes", "yes", "yes"),
+        ] {
+            assert_eq!(hostname_flag(v), flag, "{v:?}");
+            assert_eq!(hostname_restore_value(v), restore, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn virtual_names_are_refused_with_a_reason_and_physical_names_are_not() {
+        for n in [
+            "lo", "virbr0", "docker0", "veth12ab", "br-0a1b", "tun0", "wg0",
+        ] {
+            assert!(virtual_reason(n).is_some(), "{n}");
+        }
+        for n in ["enp37s0", "eth0", "wlan0", "wlp3s0", "eno1"] {
+            assert!(virtual_reason(n).is_none(), "{n}");
+        }
+    }
+
+    #[test]
+    fn terse_fields_keep_utf8_and_spaces() {
+        assert_eq!(
+            parse_fields("Kablolu bağlantı 1\\:x\n", 1).unwrap(),
+            vec!["Kablolu bağlantı 1:x"]
+        );
     }
 }
