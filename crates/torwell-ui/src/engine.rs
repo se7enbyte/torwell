@@ -25,8 +25,24 @@ pub const ENGINE_FILE_NAME: &str = if cfg!(windows) {
 } else {
     "torwell-engine"
 };
-/// Default wall-clock limit for one request.
+/// Default wall-clock limit for one read-only request.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Limit for start/stop/switch/recover: covers the polkit password prompt and Tor bootstrap,
+/// and outlasts the engine's own 15 minute elevated limit so the engine, not the UI, decides.
+/// Killing a start midway would leave the block applied with Tor not ready.
+pub const MUTATING_TIMEOUT: Duration = Duration::from_secs(16 * 60);
+
+fn limit_for(request: &[u8], read_only: Duration) -> Duration {
+    match torwell_protocol::decode_request(request).map(|r| r.command) {
+        Ok(
+            torwell_protocol::Command::Start(_)
+            | torwell_protocol::Command::Stop
+            | torwell_protocol::Command::Switch(_)
+            | torwell_protocol::Command::Recover,
+        ) => MUTATING_TIMEOUT.max(read_only),
+        _ => read_only,
+    }
+}
 /// Stderr is a diagnostic only and is read up to this many bytes.
 pub const MAX_STDERR_BYTES: u64 = 4096;
 
@@ -165,7 +181,8 @@ impl Transport for ChildEngine {
             String::from_utf8_lossy(&buf).into_owned()
         });
 
-        let deadline = Instant::now() + self.timeout;
+        let limit = limit_for(request, self.timeout);
+        let deadline = Instant::now() + limit;
         let status = loop {
             if let Some(status) = child.try_wait().map_err(|e| {
                 engine_error(
@@ -188,10 +205,7 @@ impl Transport for ChildEngine {
                 let _ = err_reader.join();
                 return Err(engine_error(
                     ErrorKind::Timeout,
-                    format!(
-                        "engine did not answer within {} ms",
-                        self.timeout.as_millis()
-                    ),
+                    format!("engine did not answer within {} ms", limit.as_millis()),
                 ));
             }
             thread::sleep(Duration::from_millis(5));
@@ -343,5 +357,17 @@ mod tests {
             interpret(&raw).unwrap_err().kind,
             ErrorKind::InvalidResponse
         );
+    }
+
+    #[test]
+    fn mutating_requests_get_the_long_limit_and_reads_keep_the_short_one() {
+        use torwell_protocol::{encode_request, Command, Request};
+        let short = Duration::from_millis(150);
+        let enc = |c| encode_request(&Request::new(c)).unwrap();
+        assert_eq!(limit_for(&enc(Command::Status), short), short);
+        assert_eq!(limit_for(&enc(Command::Inspect), short), short);
+        assert_eq!(limit_for(&enc(Command::Stop), short), MUTATING_TIMEOUT);
+        assert_eq!(limit_for(&enc(Command::Recover), short), MUTATING_TIMEOUT);
+        assert_eq!(limit_for(b"garbage", short), short);
     }
 }
